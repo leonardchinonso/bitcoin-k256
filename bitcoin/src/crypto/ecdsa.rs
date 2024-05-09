@@ -18,7 +18,7 @@ use crate::{prelude::*, CryptoError};
 const MAX_SIG_LEN: usize = 73;
 
 /// An ECDSA signature with the corresponding hash type.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct Signature {
@@ -26,6 +26,12 @@ pub struct Signature {
     pub signature: k256::ecdsa::Signature,
     /// The corresponding hash type.
     pub sighash_type: EcdsaSighashType,
+}
+
+impl std::hash::Hash for Signature {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.serialize().hash(state);
+    }
 }
 
 impl Signature {
@@ -41,7 +47,8 @@ impl Signature {
     pub fn from_slice(sl: &[u8]) -> Result<Self, Error> {
         let (sighash_type, sig) = sl.split_last().ok_or(Error::EmptySignature)?;
         let sighash_type = EcdsaSighashType::from_standard(*sighash_type as u32)?;
-        let signature = k256::ecdsa::Signature::from_der(sig).map_err(Error::Secp256k1)?;
+        let signature = k256::ecdsa::Signature::from_der(sig)
+            .map_err(|_| Error::Secp256k1(CryptoError::InvalidSignature))?;
         Ok(Signature {
             signature,
             sighash_type,
@@ -53,8 +60,9 @@ impl Signature {
     /// This does **not** perform extra heap allocation.
     pub fn serialize(&self) -> SerializedSignature {
         let mut buf = [0u8; MAX_SIG_LEN];
-        let signature = self.signature.serialize_der();
-        buf[..signature.len()].copy_from_slice(&signature);
+        let der_sign = self.signature.to_der();
+        let signature = der_sign.as_bytes();
+        buf[..signature.len()].copy_from_slice(signature);
         buf[signature.len()] = self.sighash_type as u8;
         SerializedSignature {
             data: buf,
@@ -68,7 +76,8 @@ impl Signature {
     /// [`serialize`](Self::serialize) method instead.
     pub fn to_vec(self) -> Vec<u8> {
         self.signature
-            .serialize_der()
+            .to_der()
+            .as_bytes()
             .iter()
             .copied()
             .chain(iter::once(self.sighash_type as u8))
@@ -85,7 +94,7 @@ impl Signature {
 
 impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::LowerHex::fmt(&self.signature.serialize_der().as_hex(), f)?;
+        fmt::LowerHex::fmt(&self.signature.to_der().as_bytes().as_hex(), f)?;
         fmt::LowerHex::fmt(&[self.sighash_type as u8].as_hex(), f)
     }
 }
@@ -97,7 +106,8 @@ impl FromStr for Signature {
         let bytes = Vec::from_hex(s)?;
         let (sighash_byte, signature) = bytes.split_last().ok_or(Error::EmptySignature)?;
         Ok(Signature {
-            signature: k256::ecdsa::Signature::from_der(signature)?,
+            signature: k256::ecdsa::Signature::from_der(signature)
+                .map_err(|_| Error::Secp256k1(CryptoError::InvalidSignature))?,
             sighash_type: EcdsaSighashType::from_standard(*sighash_byte as u32)?,
         })
     }

@@ -6,6 +6,7 @@
 //! at <https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki>.
 //!
 
+use core::array::TryFromSliceError;
 use core::ops::Index;
 use core::str::FromStr;
 use core::{fmt, slice};
@@ -64,11 +65,21 @@ hash_newtype! {
     pub struct XKeyIdentifier(hash160::Hash);
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct XPrivateKey([u8; 32]);
 
-impl From<&[u8]> for XPrivateKey {
-    fn from(value: &[u8]) -> Self {
-        <[u8; 32]>::from(value)
+impl TryFrom<&[u8]> for XPrivateKey {
+    type Error = TryFromSliceError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let inner = <[u8; 32]>::try_from(value)?;
+        Ok(XPrivateKey(inner))
+    }
+}
+
+impl XPrivateKey {
+    fn to_secret_key(self) -> k256::SecretKey {
+        k256::SecretKey::from_slice(self.0.as_slice()).expect("should be a valid secret key")
     }
 }
 
@@ -85,7 +96,7 @@ pub struct Xpriv {
     /// Child number of the key used to derive from parent (0 for master)
     pub child_number: ChildNumber,
     /// Private key
-    pub private_key: k256::SecretKey,
+    pub private_key: XPrivateKey,
     /// Chain code
     pub chain_code: ChainCode,
 }
@@ -118,7 +129,7 @@ pub struct Xpub {
     /// Child number of the key used to derive from parent (0 for master)
     pub child_number: ChildNumber,
     /// Public key
-    pub public_key: k256::PublicKey,
+    pub public_key: PublicKey,
     /// Chain code
     pub chain_code: ChainCode,
 }
@@ -627,13 +638,17 @@ impl Xpriv {
         let mut hmac_engine: HmacEngine<sha512::Hash> = HmacEngine::new(b"Bitcoin seed");
         hmac_engine.input(seed);
         let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
+        let private_key = match XPrivateKey::try_from(&hmac_result[..32]) {
+            Ok(p) => p,
+            Err(_) => return Err(Error::Secp256k1(CryptoError::InvalidSecretKey)),
+        };
 
         Ok(Xpriv {
             network: network.into(),
             depth: 0,
             parent_fingerprint: Default::default(),
             child_number: ChildNumber::from_normal_idx(0)?,
-            private_key: k256::SecretKey::from_slice(&hmac_result[..32])?,
+            private_key,
             chain_code: ChainCode::from_hmac(hmac_result),
         })
     }
@@ -643,7 +658,7 @@ impl Xpriv {
         PrivateKey {
             compressed: true,
             network: self.network,
-            inner: self.private_key,
+            inner: self.private_key.to_secret_key(),
         }
     }
 
@@ -655,8 +670,8 @@ impl Xpriv {
     /// Constructs BIP340 keypair for Schnorr signatures and Taproot use matching the internal
     /// secret key representation.
     pub fn to_keypair(self) -> Keypair {
-        Keypair::from(&self.private_key)
-            .expect("BIP32 internal private key representation is broken")
+        Keypair::from(&self.private_key.to_secret_key())
+        // .expect("BIP32 internal private key representation is broken")
     }
 
     /// Attempts to derive an extended private key from a path.
@@ -677,14 +692,13 @@ impl Xpriv {
             ChildNumber::Normal { .. } => {
                 // Non-hardened key: compute public data and use that
                 hmac_engine.input(
-                    // &secp256k1::PublicKey::from_secret_key(secp, &self.private_key).serialize()[..],
                     &self.to_pub().serialize()[..],
                 );
             }
             ChildNumber::Hardened { .. } => {
                 // Hardened key: use only secret data to prevent public derivation
                 hmac_engine.input(&[0u8]);
-                hmac_engine.input(&self.private_key[..]);
+                hmac_engine.input(&self.private_key.0[..]);
             }
         }
 
@@ -692,15 +706,19 @@ impl Xpriv {
         let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
         let sk = k256::SecretKey::from_slice(&hmac_result[..32])
             .expect("statistically impossible to hit");
-        let tweaked = add_tweak(sk, Scalar::from(&self.private_key))
-            .expect("statistically impossible to hit");
+        let tweaked = add_tweak(
+            sk,
+            Scalar::try_from(&self.private_key.0).expect("should be a valid secret key"),
+        )
+        .expect("statistically impossible to hit");
 
         Ok(Xpriv {
             network: self.network,
             depth: self.depth + 1,
             parent_fingerprint: self.fingerprint(),
             child_number: i,
-            private_key: tweaked,
+            private_key: XPrivateKey::try_from(tweaked.to_bytes().as_slice())
+                .expect("improbable to fail"),
             chain_code: ChainCode::from_hmac(hmac_result),
         })
     }
@@ -730,7 +748,8 @@ impl Xpriv {
             chain_code: data[13..45]
                 .try_into()
                 .expect("45 - 13 == 32, which is the ChainCode length"),
-            private_key: k256::SecretKey::from_slice(&data[46..78])?,
+            private_key: XPrivateKey::try_from(&data[46..78])
+                .expect("should be a valid u8 of 32 bytes"),
         })
     }
 
@@ -746,7 +765,7 @@ impl Xpriv {
         ret[9..13].copy_from_slice(&u32::from(self.child_number).to_be_bytes());
         ret[13..45].copy_from_slice(&self.chain_code[..]);
         ret[45] = 0;
-        ret[46..78].copy_from_slice(&self.private_key[..]);
+        ret[46..78].copy_from_slice(&self.private_key.0[..]);
         ret
     }
 
@@ -771,14 +790,14 @@ impl Xpub {
             depth: sk.depth,
             parent_fingerprint: sk.parent_fingerprint,
             child_number: sk.child_number,
-            public_key: sk.private_key.public_key(),
+            public_key: PublicKey::from(sk.private_key.to_secret_key().public_key()),
             chain_code: sk.chain_code,
         }
     }
 
     /// Constructs ECDSA compressed public key matching internal public key representation.
     pub fn to_pub(self) -> CompressedPublicKey {
-        CompressedPublicKey(self.public_key)
+        CompressedPublicKey(self.public_key.inner)
     }
 
     /// Constructs BIP340 x-only public key for BIP-340 signatures and Taproot use matching
@@ -791,7 +810,7 @@ impl Xpub {
     ///
     /// The `path` argument can be any type implementing `AsRef<ChildNumber>`, such as `DerivationPath`, for instance.
     pub fn derive_pub<P: AsRef<[ChildNumber]>>(&self, path: &P) -> Result<Xpub, Error> {
-        let mut pk: Xpub = *self;
+        let mut pk: Xpub = self.clone();
         for cnum in path.as_ref() {
             pk = pk.ckd_pub(*cnum)?
         }
@@ -810,7 +829,8 @@ impl Xpub {
 
                 let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
 
-                let private_key = k256::SecretKey::from_slice(&hmac_result[..32])?;
+                let private_key = k256::SecretKey::from_slice(&hmac_result[..32])
+                    .map_err(|_| Error::Secp256k1(CryptoError::InvalidSecretKey))?;
                 let chain_code = ChainCode::from_hmac(hmac_result);
                 Ok((private_key, chain_code))
             }
@@ -820,14 +840,15 @@ impl Xpub {
     /// Public->Public child key derivation
     pub fn ckd_pub(&self, i: ChildNumber) -> Result<Xpub, Error> {
         let (sk, chain_code) = self.ckd_pub_tweak(i)?;
-        let tweaked = add_exp_tweak(self.public_key, &sk.into())?;
+        let tweaked = add_exp_tweak(self.public_key.inner, Scalar::from(&sk))
+            .map_err(|_| Error::Secp256k1(CryptoError::InvalidPublicKey))?;
 
         Ok(Xpub {
             network: self.network,
             depth: self.depth + 1,
             parent_fingerprint: self.fingerprint(),
             child_number: i,
-            public_key: tweaked,
+            public_key: PublicKey::from(tweaked),
             chain_code,
         })
     }
@@ -847,6 +868,9 @@ impl Xpub {
             return Err(Error::UnknownVersion([b0, b1, b2, b3]));
         };
 
+        let public_key = k256::PublicKey::from_sec1_bytes(&data[45..78])
+            .map_err(|_| Error::Secp256k1(CryptoError::InvalidPublicKey))?;
+
         Ok(Xpub {
             network,
             depth: data[4],
@@ -857,7 +881,7 @@ impl Xpub {
             chain_code: data[13..45]
                 .try_into()
                 .expect("45 - 13 == 32, which is the ChainCode length"),
-            public_key: k256::PublicKey::from_sec1_bytes(&data[45..78])?,
+            public_key: PublicKey::from(public_key),
         })
     }
 
@@ -878,7 +902,7 @@ impl Xpub {
 
     /// Returns the HASH160 of the chaincode
     pub fn identifier(&self) -> XKeyIdentifier {
-        let public_key = PublicKey::new(&self.public_key);
+        let public_key = self.public_key.clone();
         let mut engine = XKeyIdentifier::engine();
         engine
             .write_all(&public_key.serialize())
@@ -1094,10 +1118,7 @@ mod tests {
         let mut pk = Xpub::from_priv(&sk);
 
         // Check derivation convenience method for Xpriv
-        assert_eq!(
-            &sk.derive_priv(&path).unwrap().to_string()[..],
-            expected_sk
-        );
+        assert_eq!(&sk.derive_priv(&path).unwrap().to_string()[..], expected_sk);
 
         // Check derivation convenience method for Xpub, should error
         // appropriately if any ChildNumber is hardened
@@ -1107,10 +1128,7 @@ mod tests {
                 Err(Error::CannotDeriveFromHardenedKey)
             );
         } else {
-            assert_eq!(
-                &pk.derive_pub(&path).unwrap().to_string()[..],
-                expected_pk
-            );
+            assert_eq!(&pk.derive_pub(&path).unwrap().to_string()[..], expected_pk);
         }
 
         // Derive keys, checking hardened and non-hardened derivation one-by-one
@@ -1123,10 +1141,7 @@ mod tests {
                     assert_eq!(pk, pk2);
                 }
                 Hardened { .. } => {
-                    assert_eq!(
-                        pk.ckd_pub(num),
-                        Err(Error::CannotDeriveFromHardenedKey)
-                    );
+                    assert_eq!(pk.ckd_pub(num), Err(Error::CannotDeriveFromHardenedKey));
                     pk = Xpub::from_priv(&sk);
                 }
             }
@@ -1202,7 +1217,7 @@ mod tests {
         let seed = hex!("000102030405060708090a0b0c0d0e0f");
 
         // m
-        test_path(&NetworkKind::Main, &seed, "".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "".parse().unwrap(),
                   "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi",
                   "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8");
 

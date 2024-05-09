@@ -19,8 +19,8 @@ use io::Write;
 
 use crate::blockdata::witness::Witness;
 use crate::consensus::{encode, Encodable};
-use crate::prelude::*;
 use crate::taproot::{LeafVersion, TapLeafHash, TAPROOT_ANNEX_PREFIX};
+use crate::{impl_thirty_two_byte_hash, prelude::*};
 use crate::{transaction, Amount, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
 
 /// Used for signature hash for invalid use of SIGHASH_SINGLE.
@@ -31,24 +31,6 @@ pub(crate) const UINT256_ONE: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0
 ];
-
-/// Dummy hash trait to replace secp256k1::ThirtyTwoByteHash
-///
-/// TODO(chinonso): Replace secp256k1::ThirtyTwoByteHash usages
-///     with this
-pub trait ThirtyTwoByteHash {
-    fn into_32(self) -> [u8; 32];
-}
-
-macro_rules! impl_thirty_two_byte_hash {
-    ($ty:ident) => {
-        impl ThirtyTwoByteHash for $ty {
-            fn into_32(self) -> [u8; 32] {
-                self.to_byte_array()
-            }
-        }
-    };
-}
 
 hash_newtype! {
     /// Hash of a transaction according to the legacy signature algorithm.

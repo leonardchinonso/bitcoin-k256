@@ -6,9 +6,12 @@
 //!
 
 pub mod ecdsa;
+pub mod error;
 pub mod key;
 pub mod scalar;
 pub mod sighash;
-pub mod error;
+
+mod arithmetic;
+mod utils;
 // Contents re-exported in `bitcoin::taproot`.
 pub(crate) mod taproot;

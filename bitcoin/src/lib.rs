@@ -83,15 +83,15 @@ pub extern crate k256;
 #[macro_use]
 extern crate actual_serde as serde;
 
-// #[cfg(test)]
-// #[macro_use]
-// mod test_macros;
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
 mod internal_macros;
+#[cfg(feature = "serde")]
+mod serde_utils;
 mod utils;
-// #[cfg(feature = "serde")]
-// mod serde_utils;
-//
-// #[macro_use]
+
+#[macro_use]
 pub mod address;
 pub mod bip152;
 pub mod bip158;
@@ -103,13 +103,13 @@ pub mod p2p;
 pub mod common;
 pub(crate) mod crypto;
 pub mod error;
-// pub mod hash_types;
+pub mod hash_types;
 pub mod merkle_tree;
 pub mod network;
 pub mod policy;
 pub mod pow;
 pub mod psbt;
-// pub mod sign_message;
+pub mod sign_message;
 pub mod taproot;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
@@ -118,7 +118,7 @@ pub use crate::{
     address::{Address, AddressType, KnownHrp},
     amount::{Amount, Denomination, SignedAmount},
     bip158::{FilterHash, FilterHeader},
-    // bip32::XKeyIdentifier,
+    bip32::XKeyIdentifier,
     blockdata::block::{self, Block, BlockHash, TxMerkleNode, WitnessMerkleNode, WitnessCommitment},
     blockdata::constants,
     blockdata::fee_rate::FeeRate,
@@ -132,13 +132,13 @@ pub use crate::{
     blockdata::witness::{self, Witness},
     common::types::{InvalidParityValue, Parity},
     consensus::encode::VarInt,
-    // consensus::params,
+    consensus::params,
     crypto::ecdsa,
     crypto::error::Error as CryptoError,
-    crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, CompressedPublicKey, WPubkeyHash, XOnlyPublicKey},
+    crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, CompressedPublicKey, WPubkeyHash, MaybePublicKey, G, XOnlyPublicKey},
     crypto::scalar::{Scalar, MaybeScalar},
     crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
-    // merkle_tree::MerkleBlock,
+    merkle_tree::MerkleBlock,
     network::{Network, NetworkKind},
     pow::{CompactTarget, Target, Work},
     psbt::Psbt,

@@ -34,7 +34,6 @@ use core::str::FromStr;
 
 use bech32::primitives::hrp::Hrp;
 use hashes::{sha256, Hash, HashEngine};
-// use secp256k1::{Secp256k1, Verification, XOnlyPublicKey};
 
 use crate::blockdata::constants::{
     MAX_SCRIPT_ELEMENT_SIZE, PUBKEY_ADDRESS_PREFIX_MAIN, PUBKEY_ADDRESS_PREFIX_TEST,

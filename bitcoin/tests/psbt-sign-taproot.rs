@@ -1,21 +1,24 @@
 #![cfg(not(feature = "rand-std"))]
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
-use secp256k1::{Keypair, Signing, Secp256k1, XOnlyPublicKey};
-use bitcoin::{absolute, Address, Network, OutPoint, PrivateKey, Psbt, script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::key::Keypair;
+use bitcoin_arch_v2 as bitcoin;
+
 use bitcoin::bip32::{DerivationPath, Fingerprint};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::opcodes::all::OP_CHECKSIG;
 use bitcoin::psbt::{GetKey, Input, KeyRequest, PsbtSighashType, SignError};
 use bitcoin::taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo};
 use bitcoin::transaction::Version;
+use bitcoin::{
+    absolute, script, Address, Network, OutPoint, PrivateKey, Psbt, ScriptBuf, Sequence,
+    Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+};
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use units::Amount;
-
 
 #[test]
 fn psbt_sign_taproot() {
-
     struct Keystore {
         sk: PrivateKey,
         mfp: Fingerprint,
@@ -23,26 +26,33 @@ fn psbt_sign_taproot() {
 
     impl GetKey for Keystore {
         type Error = SignError;
-        fn get_key<C: Signing>(&self, key_request: KeyRequest, _secp: &Secp256k1<C>) -> Result<Option<PrivateKey>, Self::Error> {
+        fn get_key(&self, key_request: KeyRequest) -> Result<Option<PrivateKey>, Self::Error> {
             match key_request {
                 KeyRequest::Bip32((mfp, _)) => {
                     if mfp == self.mfp {
-                        Ok(Some(self.sk))
+                        Ok(Some(self.sk.clone()))
                     } else {
                         Err(SignError::KeyNotFound)
                     }
                 }
-                _ => Err(SignError::KeyNotFound)
+                _ => Err(SignError::KeyNotFound),
             }
         }
     }
 
-    let secp = &Secp256k1::new();
-
     let sk_path = [
-        ("dff1c8c2c016a572914b4c5adb8791d62b4768ae9d0a61be8ab94cf5038d7d90", "86'/1'/0'/0/0"),
-        ("1ede31b0e7e47c2afc65ffd158b1b1b9d3b752bba8fd117dc8b9e944a390e8d9", "86'/1'/0'/0/1"),
-        ("1fb777f1a6fb9b76724551f8bc8ad91b77f33b8c456d65d746035391d724922a", "86'/1'/0'/0/2"),
+        (
+            "dff1c8c2c016a572914b4c5adb8791d62b4768ae9d0a61be8ab94cf5038d7d90",
+            "86'/1'/0'/0/0",
+        ),
+        (
+            "1ede31b0e7e47c2afc65ffd158b1b1b9d3b752bba8fd117dc8b9e944a390e8d9",
+            "86'/1'/0'/0/1",
+        ),
+        (
+            "1fb777f1a6fb9b76724551f8bc8ad91b77f33b8c456d65d746035391d724922a",
+            "86'/1'/0'/0/2",
+        ),
     ];
     let mfp = "73c5da0a";
 
@@ -51,19 +61,27 @@ fn psbt_sign_taproot() {
     //
 
     // Create three basic scripts to test script path spend.
-    let script1 = create_basic_single_sig_script(secp, sk_path[0].0); // m/86'/1'/0'/0/0
-    let script2 = create_basic_single_sig_script(secp, sk_path[1].0); // m/86'/1'/0'/0/1
-    let script3 = create_basic_single_sig_script(secp, sk_path[2].0); // m/86'/1'/0'/0/2
+    let script1 = create_basic_single_sig_script(sk_path[0].0); // m/86'/1'/0'/0/0
+    let script2 = create_basic_single_sig_script(sk_path[1].0); // m/86'/1'/0'/0/1
+    let script3 = create_basic_single_sig_script(sk_path[2].0); // m/86'/1'/0'/0/2
 
     // Just use one of the secret keys for the key path spend.
-    let kp = Keypair::from_seckey_str(secp, &sk_path[2].0).expect("failed to create keypair");
+    let kp = Keypair::from_seckey_str(&sk_path[2].0).expect("failed to create keypair");
 
     let internal_key = kp.x_only_public_key().0; // Ignore the parity.
 
-    let tree = create_taproot_tree(secp, script1.clone(), script2.clone(), script3.clone(), internal_key);
+    let tree = create_taproot_tree(
+        script1.clone(),
+        script2.clone(),
+        script3.clone(),
+        internal_key,
+    );
 
     let address = create_p2tr_address(tree.clone());
-    assert_eq!("tb1pytee2mxz0f4fkrsqqws2lsgnkp8nrw2atjkjy2n9gahggsphr0gszaxxmv", address.to_string());
+    assert_eq!(
+        "tb1pytee2mxz0f4fkrsqqws2lsgnkp8nrw2atjkjy2n9gahggsphr0gszaxxmv",
+        address.to_string()
+    );
 
     // m/86'/1'/0'/0/7
     let to_address = "tb1pyfv094rr0vk28lf8v9yx3veaacdzg26ztqk4ga84zucqqhafnn5q9my9rz";
@@ -74,7 +92,11 @@ fn psbt_sign_taproot() {
         //
         // Step 1: create psbt for key path spend.
         //
-        let mut psbt_key_path_spend = create_psbt_for_taproot_key_path_spend(address.clone(), to_address.clone(), tree.clone());
+        let mut psbt_key_path_spend = create_psbt_for_taproot_key_path_spend(
+            address.clone(),
+            to_address.clone(),
+            tree.clone(),
+        );
 
         //
         // Step 2: sign psbt.
@@ -83,10 +105,21 @@ fn psbt_sign_taproot() {
             mfp: Fingerprint::from_str(mfp).unwrap(),
             sk: PrivateKey::new(kp.secret_key(), Network::Testnet),
         };
-        let _ = psbt_key_path_spend.sign(&keystore, secp);
+        let _ = psbt_key_path_spend.sign(&keystore);
 
-        let sig = "92864dc9e56b6260ecbd54ec16b94bb597a2e6be7cca0de89d75e17921e0e1528cba32dd04217175c237e1835b5db1c8b384401718514f9443dce933c6ba9c87";
-        assert_eq!(sig, psbt_key_path_spend.inputs[0].tap_key_sig.unwrap().signature.to_string());
+        // let sig = "92864dc9e56b6260ecbd54ec16b94bb597a2e6be7cca0de89d75e17921e0e1528cba32dd04217175c237e1835b5db1c8b384401718514f9443dce933c6ba9c87";
+        let sig = [
+            146, 134, 77, 201, 229, 107, 98, 96, 236, 189, 84, 236, 22, 185, 75, 181, 151, 162,
+            230, 190, 124, 202, 13, 232, 157, 117, 225, 121, 33, 224, 225, 82, 140, 186, 50, 221,
+            4, 33, 113, 117, 194, 55, 225, 131, 91, 93, 177, 200, 179, 132, 64, 23, 24, 81, 79,
+            148, 67, 220, 233, 51, 198, 186, 156, 135,
+        ];
+        let actual_sig = psbt_key_path_spend.inputs[0]
+            .tap_key_sig
+            .unwrap()
+            .signature
+            .to_bytes();
+        assert_eq!(sig, actual_sig);
 
         //
         // Step 3: finalize psbt.
@@ -105,7 +138,7 @@ fn psbt_sign_taproot() {
     // script path spend
     {
         // use private key of path "m/86'/1'/0'/0/1" as signing key
-        let kp = Keypair::from_seckey_str(secp, &sk_path[1].0).expect("failed to create keypair");
+        let kp = Keypair::from_seckey_str(&sk_path[1].0).expect("failed to create keypair");
         let x_only_pubkey = kp.x_only_public_key().0;
         let signing_key_path = sk_path[1].1;
 
@@ -117,15 +150,34 @@ fn psbt_sign_taproot() {
         //
         // Step 1: create psbt for script path spend.
         //
-        let mut psbt_script_path_spend = create_psbt_for_taproot_script_path_spend(address.clone(), to_address.clone(), tree.clone(), x_only_pubkey, signing_key_path, script2.clone());
+        let mut psbt_script_path_spend = create_psbt_for_taproot_script_path_spend(
+            address.clone(),
+            to_address.clone(),
+            tree.clone(),
+            x_only_pubkey,
+            signing_key_path,
+            script2.clone(),
+        );
 
         //
         // Step 2: sign psbt.
         //
-        let _ = psbt_script_path_spend.sign(&keystore, secp);
+        let _ = psbt_script_path_spend.sign(&keystore);
 
-        let sig = "9c1466e1631a58c55fcb8642ce5f7896314f4b565d92c5c80b17aa9abf56d22e0b5e5dcbcfe836bbd7d409491f58aa9e1f68a491ef8f05eef62fb50ffac85727";
-        assert_eq!(sig, psbt_script_path_spend.inputs[0].tap_script_sigs.get(&(x_only_pubkey, script2.clone().tapscript_leaf_hash())).unwrap().signature.to_string());
+        // let sig = "9c1466e1631a58c55fcb8642ce5f7896314f4b565d92c5c80b17aa9abf56d22e0b5e5dcbcfe836bbd7d409491f58aa9e1f68a491ef8f05eef62fb50ffac85727";
+        let sig = [
+            156, 20, 102, 225, 99, 26, 88, 197, 95, 203, 134, 66, 206, 95, 120, 150, 49, 79, 75,
+            86, 93, 146, 197, 200, 11, 23, 170, 154, 191, 86, 210, 46, 11, 94, 93, 203, 207, 232,
+            54, 187, 215, 212, 9, 73, 31, 88, 170, 158, 31, 104, 164, 145, 239, 143, 5, 238, 246,
+            47, 181, 15, 250, 200, 87, 39,
+        ];
+        let actual_sig = psbt_script_path_spend.inputs[0]
+            .tap_script_sigs
+            .get(&(x_only_pubkey, script2.clone().tapscript_leaf_hash()))
+            .unwrap()
+            .signature
+            .to_bytes();
+        assert_eq!(sig, actual_sig);
 
         //
         // Step 3: finalize psbt.
@@ -142,8 +194,8 @@ fn psbt_sign_taproot() {
     }
 }
 
-fn create_basic_single_sig_script(secp: &Secp256k1::<secp256k1::All>, sk: &str) -> ScriptBuf {
-    let kp = Keypair::from_seckey_str(secp, sk).expect("failed to create keypair");
+fn create_basic_single_sig_script(sk: &str) -> ScriptBuf {
+    let kp = Keypair::from_seckey_str(sk).expect("failed to create keypair");
     let x_only_pubkey = kp.x_only_public_key().0;
     script::Builder::new()
         .push_slice(x_only_pubkey.serialize())
@@ -151,12 +203,17 @@ fn create_basic_single_sig_script(secp: &Secp256k1::<secp256k1::All>, sk: &str) 
         .into_script()
 }
 
-fn create_taproot_tree(secp: &Secp256k1::<secp256k1::All>, script1: ScriptBuf, script2: ScriptBuf, script3: ScriptBuf, internal_key: XOnlyPublicKey) -> TaprootSpendInfo {
+fn create_taproot_tree(
+    script1: ScriptBuf,
+    script2: ScriptBuf,
+    script3: ScriptBuf,
+    internal_key: XOnlyPublicKey,
+) -> TaprootSpendInfo {
     let builder = TaprootBuilder::new();
     let builder = builder.add_leaf(2, script1).unwrap();
     let builder = builder.add_leaf(2, script2).unwrap();
     let builder = builder.add_leaf(1, script3).unwrap();
-    builder.finalize(secp, internal_key).unwrap()
+    builder.finalize(internal_key).unwrap()
 }
 
 fn create_p2tr_address(tree: TaprootSpendInfo) -> Address {
@@ -164,19 +221,26 @@ fn create_p2tr_address(tree: TaprootSpendInfo) -> Address {
     Address::p2tr_tweaked(output_key, Network::Testnet)
 }
 
-fn create_psbt_for_taproot_key_path_spend(from_address: Address, to_address: Address, tree: TaprootSpendInfo) -> Psbt {
-
+fn create_psbt_for_taproot_key_path_spend(
+    from_address: Address,
+    to_address: Address,
+    tree: TaprootSpendInfo,
+) -> Psbt {
     let send_value = 6400;
-    let out_puts = vec![
-        TxOut { value: Amount::from_sat(send_value), script_pubkey: to_address.script_pubkey() },
-    ];
+    let out_puts = vec![TxOut {
+        value: Amount::from_sat(send_value),
+        script_pubkey: to_address.script_pubkey(),
+    }];
     let prev_tx_id = "06980ca116f74c7845a897461dd0e1d15b114130176de5004957da516b4dee3a";
 
     let transaction = Transaction {
         version: Version(2),
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: prev_tx_id.parse().unwrap(), vout: 0 },
+            previous_output: OutPoint {
+                txid: prev_tx_id.parse().unwrap(),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence(0xFFFFFFFF), // Ignore nSequence.
             witness: Witness::default(),
@@ -185,7 +249,6 @@ fn create_psbt_for_taproot_key_path_spend(from_address: Address, to_address: Add
     };
 
     let mut psbt = Psbt::from_unsigned_tx(transaction).unwrap();
-
 
     let mfp = "73c5da0a";
     let internal_key_path = "86'/1'/0'/0/2";
@@ -206,7 +269,10 @@ fn create_psbt_for_taproot_key_path_spend(from_address: Address, to_address: Add
     let mut input = Input {
         witness_utxo: {
             let script_pubkey = from_address.script_pubkey();
-            Some(TxOut { value: Amount::from_sat(utxo_value), script_pubkey })
+            Some(TxOut {
+                value: Amount::from_sat(utxo_value),
+                script_pubkey,
+            })
         },
         tap_key_origins: origins,
         ..Default::default()
@@ -233,20 +299,31 @@ fn finalize_psbt_for_key_path_spend(mut psbt: Psbt) -> Psbt {
     psbt
 }
 
-fn create_psbt_for_taproot_script_path_spend(from_address: Address, to_address: Address, tree: TaprootSpendInfo, x_only_pubkey_of_signing_key: XOnlyPublicKey, signing_key_path: &str, use_script: ScriptBuf) -> Psbt {
+fn create_psbt_for_taproot_script_path_spend(
+    from_address: Address,
+    to_address: Address,
+    tree: TaprootSpendInfo,
+    x_only_pubkey_of_signing_key: XOnlyPublicKey,
+    signing_key_path: &str,
+    use_script: ScriptBuf,
+) -> Psbt {
     let utxo_value = 6280;
     let send_value = 6000;
     let mfp = "73c5da0a";
 
-    let out_puts = vec![
-        TxOut { value: Amount::from_sat(send_value), script_pubkey: to_address.script_pubkey() },
-    ];
+    let out_puts = vec![TxOut {
+        value: Amount::from_sat(send_value),
+        script_pubkey: to_address.script_pubkey(),
+    }];
     let prev_tx_id = "9d7c6770fca57285babab60c51834cfcfd10ad302119cae842d7216b4ac9a376";
     let transaction = Transaction {
         version: Version(2),
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: prev_tx_id.parse().unwrap(), vout: 0 },
+            previous_output: OutPoint {
+                txid: prev_tx_id.parse().unwrap(),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence(0xFFFFFFFF), // Ignore nSequence.
             witness: Witness::default(),
@@ -270,14 +347,18 @@ fn create_psbt_for_taproot_script_path_spend(from_address: Address, to_address: 
 
     let mut tap_scripts = BTreeMap::new();
     tap_scripts.insert(
-        tree.control_block(&(use_script.clone(), LeafVersion::TapScript)).unwrap(),
+        tree.control_block(&(use_script.clone(), LeafVersion::TapScript))
+            .unwrap(),
         (use_script.clone(), LeafVersion::TapScript),
     );
 
     let mut input = Input {
         witness_utxo: {
-            let script_pubkey= from_address.script_pubkey();
-            Some(TxOut { value: Amount::from_sat(utxo_value), script_pubkey })
+            let script_pubkey = from_address.script_pubkey();
+            Some(TxOut {
+                value: Amount::from_sat(utxo_value),
+                script_pubkey,
+            })
         },
         tap_key_origins: origins,
         tap_scripts,
@@ -290,7 +371,6 @@ fn create_psbt_for_taproot_script_path_spend(from_address: Address, to_address: 
     psbt.inputs = vec![input];
     psbt
 }
-
 
 fn finalize_psbt_for_script_path_spend(mut psbt: Psbt) -> Psbt {
     psbt.inputs.iter_mut().for_each(|input| {

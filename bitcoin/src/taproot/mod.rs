@@ -19,7 +19,7 @@ use k256::{NonZeroScalar, Secp256k1};
 
 use crate::consensus::Encodable;
 use crate::crypto::key::{TapTweak, TweakedPublicKey, UntweakedPublicKey, XOnlyPublicKey};
-use crate::prelude::*;
+use crate::{prelude::*, Scalar};
 use crate::{CryptoError, Parity};
 use crate::{Script, ScriptBuf};
 
@@ -76,11 +76,11 @@ impl TapTweakHash {
     }
 
     /// Converts a `TapTweakHash` into a `Scalar` ready for use with key tweaking API.
-    pub fn to_scalar(self) -> k256::NonZeroScalar {
+    pub fn to_scalar(self) -> Scalar {
         // This is statistically extremely unlikely to panic.
         // byte array must be of type Big Endian
-        let inner = k256::NonZeroScalar::try_from(self.to_byte_array())
-            .expect("hash value greater than curve order or is zero");
+        Scalar::try_from(self.to_byte_array().as_slice())
+            .expect("hash value greater than curve order or is zero")
     }
 }
 
@@ -217,7 +217,7 @@ impl TaprootSpendInfo {
     /// weights of satisfaction for that script.
     ///
     /// See [`TaprootBuilder::with_huffman_tree`] for more detailed documentation.
-    pub fn with_huffman_tree<C, I>(
+    pub fn with_huffman_tree<I>(
         internal_key: UntweakedPublicKey,
         script_weights: I,
     ) -> Result<Self, TaprootBuilderError>
@@ -1213,7 +1213,7 @@ impl ControlBlock {
 
         let leaf_version = LeafVersion::from_consensus(sl[0] & TAPROOT_LEAF_MASK)?;
         let internal_key = UntweakedPublicKey::from_slice(&sl[1..TAPROOT_CONTROL_BASE_SIZE])
-            .map_err(TaprootError::InvalidInternalKey)?;
+            .map_err(|_| TaprootError::InvalidInternalKey(CryptoError::InvalidPublicKey))?;
         let merkle_branch = TaprootMerkleBranch::decode(&sl[TAPROOT_CONTROL_BASE_SIZE..])?;
         Ok(ControlBlock {
             leaf_version,
@@ -1271,7 +1271,8 @@ impl ControlBlock {
         let tweak =
             TapTweakHash::from_key_and_tweak(self.internal_key, Some(curr_hash)).to_scalar();
         self.internal_key
-            .tweak_add_check(&output_key, self.output_key_parity, tweak)
+            .tweak_add_check(output_key.clone(), self.output_key_parity, tweak)
+            .expect("checking tweaked add should not fail")
     }
 }
 
@@ -1697,7 +1698,6 @@ mod test {
 
     #[test]
     fn control_block_verify() {
-        let secp = Secp256k1::verification_only();
         // test vectors obtained from printing values in feature_taproot.py from Bitcoin Core
         _verify_tap_commitments("51205dc8e62b15e0ebdf44751676be35ba32eed2e84608b290d4061bbff136cd7ba9", "6a", "c1a9d6f66cd4b25004f526bfa873e56942f98e8e492bd79ed6532b966104817c2bda584e7d32612381cf88edc1c02e28a296e807c16ad22f591ee113946e48a71e0641e660d1e5392fb79d64838c2b84faf04b7f5f283c9d8bf83e39e177b64372a0cd22eeab7e093873e851e247714eff762d8a30be699ba4456cfe6491b282e193a071350ae099005a5950d74f73ba13077a57bc478007fb0e4d1099ce9cf3d4");
         _verify_tap_commitments("5120e208c869c40d8827101c5ad3238018de0f3f5183d77a0c53d18ac28ddcbcd8ad", "f4", "c0a0eb12e60a52614986c623cbb6621dcdba3a47e3be6b37e032b7a11c7b98f40090ab1f4890d51115998242ebce636efb9ede1b516d9eb8952dc1068e0335306199aaf103cceb41d9bc37ec231aca89b984b5fd3c65977ce764d51033ac65adb4da14e029b1e154a85bfd9139e7aa2720b6070a4ceba8264ca61d5d3ac27aceb9ef4b54cd43c2d1fd5e11b5c2e93cf29b91ea3dc5b832201f02f7473a28c63246");
@@ -1745,7 +1745,6 @@ mod test {
 
     #[test]
     fn build_huffman_tree() {
-        let secp = Secp256k1::verification_only();
         let internal_key = UntweakedPublicKey::from_str(
             "93c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51",
         )
@@ -1798,7 +1797,6 @@ mod test {
 
     #[test]
     fn taptree_builder() {
-        let secp = Secp256k1::verification_only();
         let internal_key = UntweakedPublicKey::from_str(
             "93c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51",
         )

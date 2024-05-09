@@ -90,7 +90,7 @@ pub struct Input {
     /// A map from public keys needed to sign this input to their corresponding
     /// master key fingerprints and derivation paths.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
-    pub bip32_derivation: BTreeMap<k256::PublicKey, KeySource>,
+    pub bip32_derivation: BTreeMap<PublicKey, KeySource>,
     /// The finalized, fully-constructed scriptSig with signatures and any other
     /// scripts necessary for this input to pass validation.
     pub final_script_sig: Option<ScriptBuf>,
@@ -307,7 +307,7 @@ impl Input {
             }
             PSBT_IN_BIP32_DERIVATION => {
                 impl_psbt_insert_pair! {
-                    self.bip32_derivation <= <raw_key: k256::PublicKey>|<raw_value: KeySource>
+                    self.bip32_derivation <= <raw_key: PublicKey>|<raw_value: KeySource>
                 }
             }
             PSBT_IN_FINAL_SCRIPTSIG => {

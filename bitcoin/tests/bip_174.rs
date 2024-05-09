@@ -1,5 +1,6 @@
 //! Tests PSBT integration vectors from BIP 174
 //! defined at <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#test-vectors>
+use bitcoin_arch_v2 as bitcoin;
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -11,7 +12,6 @@ use bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bitcoin::hex::FromHex;
 use bitcoin::psbt::{Psbt, PsbtSighashType};
 use bitcoin::script::PushBytes;
-use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{
     absolute, Amount, Denomination, NetworkKind, OutPoint, PrivateKey, PublicKey, ScriptBuf,
     Sequence, Transaction, TxIn, TxOut, Witness,
@@ -24,18 +24,18 @@ fn hex_psbt(s: &str) -> Psbt {
 }
 
 #[track_caller]
-fn hex_script(s: &str) -> ScriptBuf { ScriptBuf::from_hex(s).expect("valid hex digits") }
+fn hex_script(s: &str) -> ScriptBuf {
+    ScriptBuf::from_hex(s).expect("valid hex digits")
+}
 
 #[test]
 fn bip174_psbt_workflow() {
-    let secp = Secp256k1::new();
-
     //
     // Step 0: Create the extended private key from the test vector data.
     //
 
     let ext_priv = build_extended_private_key();
-    let ext_pub = Xpub::from_priv(&secp, &ext_priv);
+    let ext_pub = Xpub::from_priv(&ext_priv);
     let parent_fingerprint = ext_pub.fingerprint();
 
     //
@@ -63,8 +63,14 @@ fn bip174_psbt_workflow() {
 
     // Strings from BIP 174 test vector.
     let test_vector = vec![
-        ("cP53pDbR5WtAD8dYAW9hhTjuvvTVaEiQBdrz9XPrgLBeRFiyCbQr", "0h/0h/0h"), // from_priv, into_derivation_path?
-        ("cR6SXDoyfQrcp4piaiHE97Rsgta9mNhGTen9XeonVgwsh4iSgw6d", "0h/0h/2h"),
+        (
+            "cP53pDbR5WtAD8dYAW9hhTjuvvTVaEiQBdrz9XPrgLBeRFiyCbQr",
+            "0h/0h/0h",
+        ), // from_priv, into_derivation_path?
+        (
+            "cR6SXDoyfQrcp4piaiHE97Rsgta9mNhGTen9XeonVgwsh4iSgw6d",
+            "0h/0h/2h",
+        ),
     ];
 
     // We pass the keys to the signer after doing verification to make explicit
@@ -78,8 +84,14 @@ fn bip174_psbt_workflow() {
 
     // Strings from BIP 174 test vector.
     let test_vector = vec![
-        ("cT7J9YpCwY3AVRFSjN6ukeEeWY6mhpbJPxRaDaP5QTdygQRxP9Au", "0h/0h/1h"),
-        ("cNBc3SWUip9PPm1GjRoLEJT6T41iNzCYtD7qro84FMnM5zEqeJsE", "0h/0h/3h"),
+        (
+            "cT7J9YpCwY3AVRFSjN6ukeEeWY6mhpbJPxRaDaP5QTdygQRxP9Au",
+            "0h/0h/1h",
+        ),
+        (
+            "cNBc3SWUip9PPm1GjRoLEJT6T41iNzCYtD7qro84FMnM5zEqeJsE",
+            "0h/0h/3h",
+        ),
     ];
 
     let keys = parse_and_verify_keys(&ext_priv, &test_vector);
@@ -122,7 +134,7 @@ fn build_extended_private_key() -> Xpriv {
     let xpriv = Xpriv::from_str(extended_private_key).unwrap();
 
     let sk = PrivateKey::from_wif(seed).unwrap();
-    let seeded = Xpriv::new_master(NetworkKind::Test, &sk.inner.secret_bytes()).unwrap();
+    let seeded = Xpriv::new_master(NetworkKind::Test, &sk.inner.to_bytes().to_vec()).unwrap();
     assert_eq!(xpriv, seeded);
 
     xpriv
@@ -222,12 +234,30 @@ fn update_psbt(mut psbt: Psbt, fingerprint: Fingerprint) -> Psbt {
     // Public key and its derivation path (these are the child pubkeys for our `Xpriv`,
     // can be verified by deriving the key using this derivation path).
     let pk_path = vec![
-        ("029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f", "0h/0h/0h"),
-        ("02dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d7", "0h/0h/1h"),
-        ("03089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc", "0h/0h/2h"),
-        ("023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e73", "0h/0h/3h"),
-        ("03a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca58771", "0h/0h/4h"),
-        ("027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b50051096", "0h/0h/5h"),
+        (
+            "029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f",
+            "0h/0h/0h",
+        ),
+        (
+            "02dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d7",
+            "0h/0h/1h",
+        ),
+        (
+            "03089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc",
+            "0h/0h/2h",
+        ),
+        (
+            "023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e73",
+            "0h/0h/3h",
+        ),
+        (
+            "03a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca58771",
+            "0h/0h/4h",
+        ),
+        (
+            "027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b50051096",
+            "0h/0h/5h",
+        ),
     ];
 
     let expected_psbt_hex = include_str!("data/update_1_psbt_hex");
@@ -271,7 +301,7 @@ fn bip32_derivation(
     fingerprint: Fingerprint,
     pk_path: &[(&str, &str)],
     indecies: Vec<usize>,
-) -> BTreeMap<secp256k1::PublicKey, KeySource> {
+) -> BTreeMap<PublicKey, KeySource> {
     let mut tree = BTreeMap::new();
     for i in indecies {
         let pk = pk_path[i].0;
@@ -280,7 +310,7 @@ fn bip32_derivation(
         let pk = PublicKey::from_str(pk).unwrap();
         let path = path.into_derivation_path().unwrap();
 
-        tree.insert(pk.inner, (fingerprint, path));
+        tree.insert(pk, (fingerprint, path));
     }
     tree
 }
@@ -309,18 +339,19 @@ fn parse_and_verify_keys(
     ext_priv: &Xpriv,
     sk_path: &[(&str, &str)],
 ) -> BTreeMap<PublicKey, PrivateKey> {
-    let secp = &Secp256k1::new();
-
     let mut key_map = BTreeMap::new();
     for (secret_key, derivation_path) in sk_path.iter() {
         let wif_priv = PrivateKey::from_wif(secret_key).expect("failed to parse key");
 
-        let path =
-            derivation_path.into_derivation_path().expect("failed to convert derivation path");
-        let derived_priv =
-            ext_priv.derive_priv(secp, &path).expect("failed to derive ext priv key").to_priv();
+        let path = derivation_path
+            .into_derivation_path()
+            .expect("failed to convert derivation path");
+        let derived_priv = ext_priv
+            .derive_priv(&path)
+            .expect("failed to derive ext priv key")
+            .to_priv();
         assert_eq!(wif_priv, derived_priv);
-        let derived_pub = derived_priv.public_key(secp);
+        let derived_pub = derived_priv.public_key();
         key_map.insert(derived_pub, derived_priv);
     }
     key_map
@@ -410,8 +441,7 @@ fn combine_lexicographically() {
 
 /// Signs `psbt` with `keys` if required.
 fn sign(mut psbt: Psbt, keys: BTreeMap<bitcoin::PublicKey, PrivateKey>) -> Psbt {
-    let secp = Secp256k1::new();
-    psbt.sign(&keys, &secp).unwrap();
+    psbt.sign(&keys).unwrap();
     psbt
 }
 

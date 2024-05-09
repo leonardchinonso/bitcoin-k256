@@ -1,6 +1,13 @@
 use once_cell::sync::Lazy;
+use subtle::{ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
 
-use crate::crypto::key::PublicKey;
+use crate::crypto::{
+    key::PublicKey,
+    utils::{ct_slice_lex_cmp, xor_arrays},
+};
+
+/// The largest possible 256-bit integer, represented as a byte array.
+const MAX_U256: [u8; 32] = [0xFF; 32];
 
 /// Represents an elliptic curve scalar value which might be zero.
 /// Supports all the same constant-time arithmetic operators supported
@@ -29,6 +36,8 @@ pub enum MaybeScalar {
 }
 
 use MaybeScalar::*;
+
+use super::error::{InvalidScalarBytes, ZeroScalarError};
 
 impl MaybeScalar {
     /// Returns a valid `MaybeScalar` with a value of 1.
@@ -78,9 +87,24 @@ impl MaybeScalar {
 
     /// Converts the `MaybeScalar` into a `Result<Scalar, String>`,
     /// returning `Ok(Scalar)` if the scalar is a valid non-zero number, or
-    /// `Err(String)` if `maybe_scalar == MaybeScalar::Zero`.
-    pub fn not_zero(self) -> Result<Scalar, String> {
+    /// `Err(ZeroScalarError)` if `maybe_scalar == MaybeScalar::Zero`.
+    pub fn not_zero(self) -> Result<Scalar, ZeroScalarError> {
         Scalar::try_from(self)
+    }
+
+    /// Parses a non-zero scalar in the range `[0, n)` from a given byte slice,
+    /// which must be exactly 32-byte long and must represent the scalar in
+    /// big-endian format.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, InvalidScalarBytes> {
+        Scalar::try_from(bytes)
+            .map(MaybeScalar::Valid)
+            .or_else(|e| {
+                if bool::from(bytes.ct_eq(&[0; 32])) {
+                    Ok(MaybeScalar::Zero)
+                } else {
+                    Err(e)
+                }
+            })
     }
 
     /// Coerces the `MaybeScalar` into a [`Scalar`]. Panics if `self == MaybeScalar::Zero`.
@@ -89,6 +113,76 @@ impl MaybeScalar {
             Valid(point) => point,
             Zero => panic!("called unwrap on MaybeScalar::Zero"),
         }
+    }
+
+    /// This impl is a courtesy of the secp crate.
+    ///
+    /// Converts a 32-byte array into a `MaybeScalar` by interpreting it as
+    /// a big-endian integer `z` and reducing `z` modulo some given `modulus`
+    /// in constant time. This modulus must less than or equal to the secp256k1
+    /// curve order `n`.
+    ///
+    /// Unfortunately libsecp256k1 does not expose this functionality, so we have done
+    /// our best to reimplement modular reduction in constant time using only scalar
+    /// arithmetic on numbers in the  range `[0, n)`.
+    ///
+    /// Instead of taking the remainder `z % modulus` directly (which we can't do with
+    /// libsecp256k1), we use XOR to compute the relative distances from `z` and `modulus`
+    /// to some independent constant, specifically `MAX_U256`. We denote the distances as:
+    ///
+    /// - `q = MAX_U256 - z` and
+    /// - `r = MAX_U256 - modulus`
+    ///
+    /// As long as both distances are guaranteed to be smaller than the curve order `n`, this
+    /// gives us a way to compute `z % modulus` safely in constant time: by computing the
+    /// difference of the two relative distances:
+    ///
+    /// ```notrust
+    /// r - q = (MAX_U256 - modulus) - (MAX_U256 - z)
+    ///       = z - modulus
+    /// ```
+    ///
+    /// The above is only needed when `z` might be greater than the `modulus`. If instead
+    /// `z < modulus`, we set `q = z` and return `q` in constant time, throwing away the
+    /// result of subtracting `r - q`.
+    fn reduce_from_internal(z_bytes: &[u8; 32], modulus: &[u8; 32]) -> MaybeScalar {
+        // Modulus must be less than or equal to `n`, as `n-1` is the largest number we can represent.
+        debug_assert!(modulus <= &CURVE_ORDER_BYTES);
+
+        let modulus_neg_bytes = xor_arrays(&modulus, &MAX_U256);
+
+        // Modulus must not be too small either, or we won't be able
+        // to represent the distance to MAX_U256.
+        debug_assert!(modulus_neg_bytes <= CURVE_ORDER_BYTES);
+
+        // Although we cannot operate arithmetically on numbers larger than `n-1`, we can
+        // still use XOR to subtract from a number represented by all one-bits, such as
+        // MAX_U256.
+        let z_bytes_neg = xor_arrays(z_bytes, &MAX_U256);
+
+        let z_needs_reduction = ct_slice_lex_cmp(z_bytes, modulus).ct_gt(&std::cmp::Ordering::Less);
+
+        let q_bytes = <[u8; 32]>::conditional_select(
+            z_bytes,      // `z < modulus`; set `q = z`
+            &z_bytes_neg, // `z >= modulus`; set `q = MAX_U256 - z` (implies q <= modulus)
+            z_needs_reduction,
+        );
+
+        // By this point, we know for sure that `q_bytes` represents an integer less than `n`,
+        // so `try_from` should always work here.
+        let q = MaybeScalar::try_from(&q_bytes).unwrap();
+
+        // Modulus distance `r` should also always be less than the curve order.
+        let r = MaybeScalar::try_from(&modulus_neg_bytes).unwrap();
+
+        // if z < modulus
+        //   return q = z
+        //
+        // else
+        //  return r - q = (MAX_U256 - modulus) - (MAX_U256 - z)
+        //               = MAX_U256 - modulus - MAX_U256 + z
+        //               = z - modulus
+        MaybeScalar::conditional_select(&q, &(r - q), z_needs_reduction)
     }
 }
 
@@ -192,13 +286,8 @@ impl Scalar {
     /// Parses a non-zero scalar in the range `[1, n)` from a given byte slice,
     /// which must be exactly 32-byte long and must represent the scalar in
     /// big-endian format.
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
-        let inner = match k256::NonZeroScalar::try_from(bytes) {
-            Ok(s) => s,
-            Err(err) => {
-                return Err(format!("Error getting Scalar from slice: {:?}", err));
-            }
-        };
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, InvalidScalarBytes> {
+        let inner = k256::NonZeroScalar::try_from(bytes).map_err(|_| InvalidScalarBytes)?;
         Ok(Scalar::from(inner))
     }
 
@@ -212,23 +301,235 @@ impl Scalar {
         let inner = k256::PublicKey::from_secret_scalar(&self.inner);
         PublicKey::new(inner)
     }
-}
 
-impl TryFrom<&[u8; 32]> for Scalar {
-    type Error = String;
+    /// Checks if the scalar is greater than the SECP256k1 curve - 1
+    pub fn greater_than_curve_order_minus_one(&self) -> bool {
+        bool::from(self.ct_gt(&Self::max()))
+    }
 
-    /// Attempts to parse a 32-byte array as a scalar in the range `[1, n)`
-    /// in constant time, where `n` is the curve order.
+    /// Converts a 32-byte array into a `Scalar` by interpreting it as a big-endian
+    /// integer `z` and returning `(z % (n-1)) + 1`, where `n` is the secp256k1
+    /// curve order. This always returns a valid non-zero scalar in the range `[1, n)`.
+    /// All operations are constant-time, except if `z` works out to be zero.
     ///
-    /// Returns [`InvalidScalarBytes`] if the integer represented by the bytes
-    /// is greater than or equal to the curve order, or if the bytes are all zero.
-    fn try_from(bytes: &[u8; 32]) -> Result<Self, Self::Error> {
-        Self::from_slice(bytes as &[u8])
+    /// The probability that `z_bytes` represents an integer `z` larger than the
+    /// curve order is only about 1 in 2^128, but nonetheless this function makes a
+    /// best-effort attempt to parse all inputs in constant time and reduce them to
+    /// an integer in the range `[1, n)`.
+    pub fn reduce_from(z_bytes: &[u8; 32]) -> Self {
+        let reduced = MaybeScalar::reduce_from_internal(z_bytes, &CURVE_ORDER_MINUS_ONE_BYTES);
+
+        // this will never be zero, because `z` is in the range `[0, n-1)`
+        (reduced + Scalar::one()).unwrap()
     }
 }
 
-impl From<k256::NonZeroScalar> for Scalar {
-    fn from(nz_scalar: k256::NonZeroScalar) -> Self {
-        return Scalar { inner: nz_scalar };
+mod conversions {
+    use super::*;
+
+    mod internal_conversions {
+        use crate::crypto::error::ZeroScalarError;
+
+        use super::*;
+
+        impl TryFrom<MaybeScalar> for Scalar {
+            type Error = ZeroScalarError;
+
+            /// Converts the `MaybeScalar` into a `Result<Scalar, ZeroScalarError>`,
+            /// returning `Ok(Scalar)` if the scalar is a valid non-zero number,
+            /// or `Err(ZeroScalarError)` if `maybe_scalar == MaybeScalar::Zero`.
+            fn try_from(maybe_scalar: MaybeScalar) -> Result<Self, Self::Error> {
+                match maybe_scalar {
+                    Valid(scalar) => Ok(scalar),
+                    Zero => Err(ZeroScalarError),
+                }
+            }
+        }
+
+        impl From<MaybeScalar> for Option<Scalar> {
+            /// Converts [`MaybeScalar::Zero`] into `None` and a valid [`Scalar`] into `Some`.
+            fn from(maybe_scalar: MaybeScalar) -> Self {
+                match maybe_scalar {
+                    Valid(scalar) => Some(scalar),
+                    Zero => None,
+                }
+            }
+        }
+
+        impl TryFrom<&[u8]> for MaybeScalar {
+            type Error = InvalidScalarBytes;
+
+            /// Attempts to parse a 32-byte slice as a scalar in the range `[0, n)`
+            /// in constant time, where `n` is the curve order. Timing information
+            /// may be leaked if `bytes` is all zeros or not the right length.
+            ///
+            /// Returns [`InvalidScalarBytes`] if the integer represented by the bytes
+            /// is greater than or equal to the curve order, or if `bytes.len() != 32`.
+            fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+                Self::from_slice(bytes)
+            }
+        }
+
+        impl TryFrom<&[u8; 32]> for MaybeScalar {
+            type Error = InvalidScalarBytes;
+
+            /// Attempts to parse a 32-byte array as a scalar in the range `[0, n)`
+            /// in constant time, where `n` is the curve order. Timing information
+            /// may be leaked if `bytes` is the zero array, but then that's not a
+            /// very secret value, is it?
+            ///
+            /// Returns [`InvalidScalarBytes`] if the integer represented by the bytes
+            /// is greater than or equal to the curve order.
+            fn try_from(bytes: &[u8; 32]) -> Result<Self, Self::Error> {
+                Self::from_slice(bytes as &[u8])
+            }
+        }
+    }
+
+    mod external_conversions {
+        use crate::crypto::error::InvalidScalarBytes;
+
+        use super::*;
+
+        impl TryFrom<&[u8]> for Scalar {
+            type Error = InvalidScalarBytes;
+            /// Attempts to parse a 32-byte slice as a scalar in the range `[1, n)`
+            /// in constant time, where `n` is the curve order.
+            ///
+            /// Returns [`InvalidScalarBytes`] if the integer represented by the bytes
+            /// is greater than or equal to the curve order, or if the bytes are all zero.
+            ///
+            /// Fails if `bytes.len() != 32`.
+            fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+                Self::from_slice(bytes)
+            }
+        }
+
+        impl TryFrom<&[u8; 32]> for Scalar {
+            type Error = InvalidScalarBytes;
+
+            /// Attempts to parse a 32-byte array as a scalar in the range `[1, n)`
+            /// in constant time, where `n` is the curve order.
+            ///
+            /// Returns [`InvalidScalarBytes`] if the integer represented by the bytes
+            /// is greater than or equal to the curve order, or if the bytes are all zero.
+            fn try_from(bytes: &[u8; 32]) -> Result<Self, Self::Error> {
+                Self::from_slice(bytes as &[u8])
+            }
+        }
+
+        impl From<k256::SecretKey> for Scalar {
+            fn from(value: k256::SecretKey) -> Self {
+                Scalar::from(&value)
+            }
+        }
+
+        impl From<&k256::SecretKey> for Scalar {
+            fn from(value: &k256::SecretKey) -> Self {
+                Scalar::from(value.to_nonzero_scalar())
+            }
+        }
+
+        impl From<k256::NonZeroScalar> for Scalar {
+            fn from(nz_scalar: k256::NonZeroScalar) -> Self {
+                return Scalar { inner: nz_scalar };
+            }
+        }
+
+        impl From<&k256::NonZeroScalar> for Scalar {
+            fn from(nz_scalar: &k256::NonZeroScalar) -> Self {
+                return Scalar {
+                    inner: nz_scalar.to_owned(),
+                };
+            }
+        }
+
+        impl From<k256::schnorr::SigningKey> for Scalar {
+            fn from(value: k256::schnorr::SigningKey) -> Self {
+                Scalar::from(value.as_nonzero_scalar().clone())
+            }
+        }
+    }
+}
+
+mod subtle_traits {
+    use super::*;
+
+    impl ConstantTimeGreater for Scalar {
+        /// Compares this scalar against another in constant time.
+        /// Returns `subtle::Choice::from(1)` if `self` is strictly
+        /// lexicographically greater than `other`.
+        #[inline]
+        fn ct_gt(&self, other: &Self) -> subtle::Choice {
+            ct_slice_lex_cmp(&self.serialize(), &other.serialize())
+                .ct_eq(&std::cmp::Ordering::Greater)
+        }
+    }
+
+    impl ConditionallySelectable for MaybeScalar {
+        /// Conditionally selects one of two scalars in constant time. The exception is if
+        /// either `a` or `b` are [`MaybeScalar::Zero`], in which case timing information
+        /// about this fact may be leaked. No timing information about the value
+        /// of a non-zero scalar will be leaked.
+        fn conditional_select(&a: &Self, &b: &Self, choice: subtle::Choice) -> Self {
+            let a_inner = a
+                .into_option()
+                .map(|scalar| scalar.inner.as_ref().clone())
+                .unwrap_or(k256::Scalar::ZERO);
+            let b_inner = b
+                .into_option()
+                .map(|scalar| scalar.inner.as_ref().clone())
+                .unwrap_or(k256::Scalar::ZERO);
+
+            let inner_scalar = k256::Scalar::conditional_select(&a_inner, &b_inner, choice);
+
+            Option::<k256::NonZeroScalar>::from(k256::NonZeroScalar::new(inner_scalar))
+                .map(MaybeScalar::from)
+                .unwrap_or(MaybeScalar::Zero)
+        }
+    }
+}
+
+mod std_traits {
+    use super::*;
+
+    /// This implementation was duplicated from the [`secp256k1`] crate, because
+    /// [`k256::NonZeroScalar`] doesn't implement `Debug`.
+    impl std::fmt::Debug for Scalar {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            use std::hash::Hasher as _;
+            const DEBUG_HASH_TAG: &[u8] = &[
+                0x66, 0xa6, 0x77, 0x1b, 0x9b, 0x6d, 0xae, 0xa1, 0xb2, 0xee, 0x4e, 0x07, 0x49, 0x4a,
+                0xac, 0x87, 0xa9, 0xb8, 0x5b, 0x4b, 0x35, 0x02, 0xaa, 0x6d, 0x0f, 0x79, 0xcb, 0x63,
+                0xe6, 0xf8, 0x66, 0x22,
+            ]; // =SHA256(b"rust-secp256k1DEBUG");
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(DEBUG_HASH_TAG);
+            hasher.write(DEBUG_HASH_TAG);
+            hasher.write(&self.serialize());
+            let hash = hasher.finish();
+
+            f.debug_tuple(stringify!(Scalar))
+                .field(&format_args!("#{:016x}", hash))
+                .finish()
+        }
+    }
+
+    /// Reimplemented manually, because [`k256::NonZeroScalar`] doesn't implement
+    /// `PartialEq`.
+    impl PartialEq for Scalar {
+        fn eq(&self, rhs: &Self) -> bool {
+            self.inner.ct_eq(&rhs.inner).into()
+        }
+    }
+
+    impl Eq for Scalar {}
+
+    impl Default for MaybeScalar {
+        /// Returns [`MaybeScalar::Zero`].
+        fn default() -> Self {
+            MaybeScalar::Zero
+        }
     }
 }

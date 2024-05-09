@@ -157,7 +157,8 @@ impl Serialize for k256::PublicKey {
 
 impl Deserialize for k256::PublicKey {
     fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
-        k256::PublicKey::from_sec1_bytes(bytes).map_err(Error::InvalidSecp256k1PublicKey)
+        k256::PublicKey::from_sec1_bytes(bytes)
+            .map_err(|_| Error::InvalidSecp256k1PublicKey(crate::CryptoError::InvalidPublicKey))
     }
 }
 

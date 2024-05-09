@@ -13,6 +13,7 @@ mod error;
 mod map;
 pub mod raw;
 pub mod serialize;
+mod types;
 
 use core::{cmp, fmt};
 #[cfg(feature = "std")]
@@ -20,12 +21,18 @@ use std::collections::{HashMap, HashSet};
 
 use hashes::Hash;
 use internals::write_err;
-use k256::ecdsa::{signature::Signer, Signature as EcdsaSignature, SigningKey as EcdsaSigningKey};
-use k256::schnorr::{Signature as SchnorrSignature, SigningKey as SchnorrSigningKey};
+use k256::ecdsa::{
+    signature::Signer as EcdsaSigner, Signature as EcdsaSignature, SigningKey as EcdsaSigningKey,
+};
+use k256::schnorr::{
+    signature::{Signer as _, Verifier as _},
+    Signature as SchnorrSignature,
+};
 // use secp256k1::{Keypair, Message, Secp256k1, Signing, Verification};
 
 use crate::bip32::{self, KeySource, Xpriv, Xpub};
 use crate::blockdata::transaction::{self, Transaction, TxOut};
+use crate::common::types::Message;
 use crate::crypto::key::{PrivateKey, PublicKey};
 use crate::crypto::{ecdsa, taproot};
 use crate::key::{Keypair, TapTweak};
@@ -367,7 +374,7 @@ impl Psbt {
     ///
     /// - Ok: A list of the public keys used in signing.
     /// - Err: Error encountered trying to calculate the sighash AND we had the signing key.
-    fn bip32_sign_ecdsa<C, K, T>(
+    fn bip32_sign_ecdsa<K, T>(
         &mut self,
         k: &K,
         input_index: usize,
@@ -386,7 +393,7 @@ impl Psbt {
         for (pk, key_source) in input.bip32_derivation.iter() {
             let sk = if let Ok(Some(sk)) = k.get_key(KeyRequest::Bip32(key_source.clone())) {
                 sk
-            } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(PublicKey::new(*pk))) {
+            } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(*pk)) {
                 sk
             } else {
                 continue;
@@ -398,14 +405,13 @@ impl Psbt {
                 Ok((msg, sighash_ty)) => (msg, sighash_ty),
             };
 
+            let pk = sk.public_key();
             let signing_key = EcdsaSigningKey::from(sk.inner);
-            let signature: EcdsaSignature = signing_key.sign(&msg);
+            let signature: EcdsaSignature = signing_key.sign(msg.as_bytes());
             let sig = ecdsa::Signature {
                 signature,
                 sighash_type: sighash_ty,
             };
-
-            let pk = sk.public_key();
 
             input.partial_sigs.insert(pk, sig);
             used.push(pk);
@@ -461,15 +467,8 @@ impl Psbt {
                         .tap_tweak(input.tap_merkle_root)
                         .to_inner();
 
-                    // #[cfg(feature = "rand-std")]
-                    let signature: SchnorrSignature = {
-                        let signer = SchnorrSigningKey::from(key_pair);
-                        let signature: SchnorrSignature = signer.sign(&msg);
-                        // secp.sign_schnorr(&msg, &key_pair)
-                    };
-
-                    // #[cfg(not(feature = "rand-std"))]
-                    let signature = secp.sign_schnorr_no_aux_rand(&msg, &key_pair);
+                    let signer = key_pair.to_signing_key();
+                    let signature: SchnorrSignature = signer.sign(msg.as_bytes());
 
                     let signature = taproot::Signature {
                         signature,
@@ -490,16 +489,13 @@ impl Psbt {
                     .collect::<Vec<_>>();
 
                 if !leaf_hashes.is_empty() {
-                    let key_pair = Keypair::from_secret_key(secp, &sk.inner);
-
+                    let key_pair = Keypair::from_secret_key(&sk.inner);
+                    let signer = key_pair.to_signing_key();
                     for lh in leaf_hashes {
                         let (msg, sighash_type) =
                             self.sighash_taproot(input_index, cache, Some(lh))?;
 
-                        #[cfg(feature = "rand-std")]
-                        let signature = secp.sign_schnorr(&msg, &key_pair);
-                        #[cfg(not(feature = "rand-std"))]
-                        let signature = secp.sign_schnorr_no_aux_rand(&msg, &key_pair);
+                        let signature: SchnorrSignature = signer.sign(msg.as_bytes());
 
                         let signature = taproot::Signature {
                             signature,
@@ -1407,14 +1403,13 @@ mod tests {
 
     #[test]
     fn serialize_then_deserialize_output() {
-        let secp = &Secp256k1::new();
         let seed = hex!("000102030405060708090a0b0c0d0e0f");
 
-        let mut hd_keypaths: BTreeMap<k256::PublicKey, KeySource> = Default::default();
+        let mut hd_keypaths: BTreeMap<PublicKey, KeySource> = Default::default();
 
         let mut sk: Xpriv = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
 
-        let fprint = sk.fingerprint(secp);
+        let fprint = sk.fingerprint();
 
         let dpath: Vec<ChildNumber> = vec![
             ChildNumber::from_normal_idx(0).unwrap(),
@@ -1427,11 +1422,11 @@ mod tests {
             ChildNumber::from_normal_idx(31337).unwrap(),
         ];
 
-        sk = sk.derive_priv(secp, &dpath).unwrap();
+        sk = sk.derive_priv(&dpath).unwrap();
 
-        let pk = Xpub::from_priv(secp, &sk);
+        let pk = Xpub::from_priv(&sk);
 
-        hd_keypaths.insert(pk.public_key, (fprint, dpath.into()));
+        hd_keypaths.insert(PublicKey::from(pk.public_key), (fprint, dpath.into()));
 
         let expected: Output = Output {
             redeem_script: Some(
