@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 
 use hashes::Hash;
 use internals::write_err;
+use k256::ecdsa::{signature::Signer, Signature as EcdsaSignature, SigningKey as EcdsaSigningKey};
+use k256::schnorr::{Signature as SchnorrSignature, SigningKey as SchnorrSigningKey};
 // use secp256k1::{Keypair, Message, Secp256k1, Signing, Verification};
 
 use crate::bip32::{self, KeySource, Xpriv, Xpub};
@@ -318,13 +320,8 @@ impl Psbt {
     ///
     /// If an error is returned some signatures may already have been added to the PSBT. Since
     /// `partial_sigs` is a [`BTreeMap`] it is safe to retry, previous sigs will be overwritten.
-    pub fn sign<C, K>(
-        &mut self,
-        k: &K,
-        secp: &Secp256k1<C>,
-    ) -> Result<SigningKeys, (SigningKeys, SigningErrors)>
+    pub fn sign<K>(&mut self, k: &K) -> Result<SigningKeys, (SigningKeys, SigningErrors)>
     where
-        C: Signing + Verification,
         K: GetKey,
     {
         let tx = self.unsigned_tx.clone(); // clone because we need to mutably borrow when signing.
@@ -335,26 +332,22 @@ impl Psbt {
 
         for i in 0..self.inputs.len() {
             match self.signing_algorithm(i) {
-                Ok(SigningAlgorithm::Ecdsa) => {
-                    match self.bip32_sign_ecdsa(k, i, &mut cache, secp) {
-                        Ok(v) => {
-                            used.insert(i, v);
-                        }
-                        Err(e) => {
-                            errors.insert(i, e);
-                        }
+                Ok(SigningAlgorithm::Ecdsa) => match self.bip32_sign_ecdsa(k, i, &mut cache) {
+                    Ok(v) => {
+                        used.insert(i, v);
                     }
-                }
-                Ok(SigningAlgorithm::Schnorr) => {
-                    match self.bip32_sign_schnorr(k, i, &mut cache, secp) {
-                        Ok(v) => {
-                            used.insert(i, v);
-                        }
-                        Err(e) => {
-                            errors.insert(i, e);
-                        }
+                    Err(e) => {
+                        errors.insert(i, e);
                     }
-                }
+                },
+                Ok(SigningAlgorithm::Schnorr) => match self.bip32_sign_schnorr(k, i, &mut cache) {
+                    Ok(v) => {
+                        used.insert(i, v);
+                    }
+                    Err(e) => {
+                        errors.insert(i, e);
+                    }
+                },
                 Err(e) => {
                     errors.insert(i, e);
                 }
@@ -379,10 +372,8 @@ impl Psbt {
         k: &K,
         input_index: usize,
         cache: &mut SighashCache<T>,
-        secp: &Secp256k1<C>,
     ) -> Result<Vec<PublicKey>, SignError>
     where
-        C: Signing,
         T: Borrow<Transaction>,
         K: GetKey,
     {
@@ -393,9 +384,9 @@ impl Psbt {
         let mut used = vec![]; // List of pubkeys used to sign the input.
 
         for (pk, key_source) in input.bip32_derivation.iter() {
-            let sk = if let Ok(Some(sk)) = k.get_key(KeyRequest::Bip32(key_source.clone()), secp) {
+            let sk = if let Ok(Some(sk)) = k.get_key(KeyRequest::Bip32(key_source.clone())) {
                 sk
-            } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(PublicKey::new(*pk)), secp) {
+            } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(PublicKey::new(*pk))) {
                 sk
             } else {
                 continue;
@@ -407,8 +398,10 @@ impl Psbt {
                 Ok((msg, sighash_ty)) => (msg, sighash_ty),
             };
 
+            let signing_key = EcdsaSigningKey::from(sk.inner);
+            let signature: EcdsaSignature = signing_key.sign(&msg);
             let sig = ecdsa::Signature {
-                signature: secp.sign_ecdsa(&msg, &sk.inner),
+                signature,
                 sighash_type: sighash_ty,
             };
 
@@ -429,15 +422,13 @@ impl Psbt {
     /// - Ok: A list of the public keys used in signing.
     /// - Err: Error encountered trying to calculate the sighash AND we had the signing key. Also panics
     /// if input_index is out of bounds.
-    fn bip32_sign_schnorr<C, K, T>(
+    fn bip32_sign_schnorr<K, T>(
         &mut self,
         k: &K,
         input_index: usize,
         cache: &mut SighashCache<T>,
-        secp: &Secp256k1<C>,
     ) -> Result<Vec<PublicKey>, SignError>
     where
-        C: Signing + Verification,
         T: Borrow<Transaction>,
         K: GetKey,
     {
@@ -446,8 +437,7 @@ impl Psbt {
         let mut used = vec![]; // List of pubkeys used to sign the input.
 
         for (&xonly, (leaf_hashes, key_source)) in input.tap_key_origins.iter() {
-            let sk = if let Ok(Some(secret_key)) =
-                k.get_key(KeyRequest::Bip32(key_source.clone()), secp)
+            let sk = if let Ok(Some(secret_key)) = k.get_key(KeyRequest::Bip32(key_source.clone()))
             {
                 secret_key
             } else {
@@ -467,13 +457,18 @@ impl Psbt {
                 // According to BIP 371, we also need to consider the condition leaf_hashes.is_empty() for a more accurate determination.
                 if internal_key == xonly && leaf_hashes.is_empty() && input.tap_key_sig.is_none() {
                     let (msg, sighash_type) = self.sighash_taproot(input_index, cache, None)?;
-                    let key_pair = Keypair::from_secret_key(secp, &sk.inner)
-                        .tap_tweak(secp, input.tap_merkle_root)
+                    let key_pair = Keypair::from_secret_key(&sk.inner)
+                        .tap_tweak(input.tap_merkle_root)
                         .to_inner();
 
-                    #[cfg(feature = "rand-std")]
-                    let signature = secp.sign_schnorr(&msg, &key_pair);
-                    #[cfg(not(feature = "rand-std"))]
+                    // #[cfg(feature = "rand-std")]
+                    let signature: SchnorrSignature = {
+                        let signer = SchnorrSigningKey::from(key_pair);
+                        let signature: SchnorrSignature = signer.sign(&msg);
+                        // secp.sign_schnorr(&msg, &key_pair)
+                    };
+
+                    // #[cfg(not(feature = "rand-std"))]
                     let signature = secp.sign_schnorr_no_aux_rand(&msg, &key_pair);
 
                     let signature = taproot::Signature {
@@ -800,26 +795,18 @@ pub trait GetKey {
     /// - `Some(key)` if the key is found.
     /// - `None` if the key was not found but no error was encountered.
     /// - `Err` if an error was encountered while looking for the key.
-    fn get_key<C: Signing>(
-        &self,
-        key_request: KeyRequest,
-        secp: &Secp256k1<C>,
-    ) -> Result<Option<PrivateKey>, Self::Error>;
+    fn get_key(&self, key_request: KeyRequest) -> Result<Option<PrivateKey>, Self::Error>;
 }
 
 impl GetKey for Xpriv {
     type Error = GetKeyError;
 
-    fn get_key<C: Signing>(
-        &self,
-        key_request: KeyRequest,
-        secp: &Secp256k1<C>,
-    ) -> Result<Option<PrivateKey>, Self::Error> {
+    fn get_key(&self, key_request: KeyRequest) -> Result<Option<PrivateKey>, Self::Error> {
         match key_request {
             KeyRequest::Pubkey(_) => Err(GetKeyError::NotSupported),
             KeyRequest::Bip32((fingerprint, path)) => {
-                let key = if self.fingerprint(secp) == fingerprint {
-                    let k = self.derive_priv(secp, &path)?;
+                let key = if self.fingerprint() == fingerprint {
+                    let k = self.derive_priv(&path)?;
                     Some(k.to_priv())
                 } else {
                     None
@@ -843,17 +830,16 @@ macro_rules! impl_get_key_for_set {
 impl GetKey for $set<Xpriv> {
     type Error = GetKeyError;
 
-    fn get_key<C: Signing>(
+    fn get_key(
         &self,
         key_request: KeyRequest,
-        secp: &Secp256k1<C>
     ) -> Result<Option<PrivateKey>, Self::Error> {
         match key_request {
             KeyRequest::Pubkey(_) => Err(GetKeyError::NotSupported),
             KeyRequest::Bip32((fingerprint, path)) => {
                 for xpriv in self.iter() {
                     if xpriv.parent_fingerprint == fingerprint {
-                        let k = xpriv.derive_priv(secp, &path)?;
+                        let k = xpriv.derive_priv(&path)?;
                         return Ok(Some(k.to_priv()));
                     }
                 }
@@ -873,10 +859,9 @@ macro_rules! impl_get_key_for_map {
 impl GetKey for $map<PublicKey, PrivateKey> {
     type Error = GetKeyError;
 
-    fn get_key<C: Signing>(
+    fn get_key(
         &self,
         key_request: KeyRequest,
-        _: &Secp256k1<C>,
     ) -> Result<Option<PrivateKey>, Self::Error> {
         match key_request {
             KeyRequest::Pubkey(pk) => Ok(self.get(&pk).cloned()),

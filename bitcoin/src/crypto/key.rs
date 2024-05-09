@@ -17,7 +17,7 @@ use io::{Read, Write};
 use k256::elliptic_curve::point::AffineCoordinates as _;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::subtle::Choice;
-use k256::NonZeroScalar;
+use k256::{NonZeroScalar, SecretKey};
 use once_cell::sync::Lazy;
 
 use crate::blockdata::script::ScriptBuf;
@@ -1154,15 +1154,33 @@ impl Keypair {
         self.signing_key.verifying_key()
     }
 
+    pub fn from_secret_key(sec_key: SecretKey) -> Self {
+        let signing_key = SigningKey::from(sec_key);
+        Self { signing_key }
+    }
+
     pub fn add_xonly_tweak(self, tweak: Scalar) -> Result<Self, String> {
-        let signing_key = self.signing_key.clone();
-        let x_only = XOnlyPublicKey::from(self);
-        let (tweaked_public_key, _parity) = x_only.add_tweak(tweak)?;
-        let verifying_key: VerifyingKey = tweaked_public_key
-            .try_into()
-            .expect("XOnlyPublicKey into VerifyingKey should not fail");
-        let keypair = Keypair { signing_key };
-        Ok(keypair)
+        let sec_key = Scalar::from(self.signing_key.as_nonzero_scalar());
+
+        if sec_key.greater_than_curve_order_minus_one() {
+            return Err(format!(
+                "Secret key cannot be greater than or equal to the Secp256k1 curve order"
+            ));
+        }
+
+        let tweak = Scalar::reduce_from(&tweak.serialize());
+
+        // x' = (x + t) % CURVE_ORDER
+        let tweaked_scalar = sec_key + tweak;
+        let mut tweaked_scalar_bytes = tweaked_scalar.serialize();
+        tweaked_scalar_bytes = Scalar::reduce_from(&tweaked_scalar_bytes).serialize();
+
+        let signing_key = match SigningKey::from_bytes(&tweaked_scalar_bytes) {
+            Ok(s) => s,
+            Err(err) => return Err(format!("Error creating SigningKey from bytes: {:?}", err)),
+        };
+
+        Ok(Keypair { signing_key })
     }
 }
 
@@ -1276,10 +1294,8 @@ impl TapTweak for UntweakedKeypair {
     /// The tweaked key and its parity.
     fn tap_tweak(self, merkle_root: Option<TapNodeHash>) -> TweakedKeypair {
         let (pubkey, _parity) = XOnlyPublicKey::from_keypair(&self);
-        let tweak = TapTweakHash::from_key_and_tweak(pubkey, merkle_root)
-            .to_scalar()
-            .to_bytes();
-        let tweak = Scalar::from_slice(tweak.as_slice()).unwrap();
+        let tweak = TapTweakHash::from_key_and_tweak(pubkey, merkle_root).to_scalar();
+        let tweak = Scalar::from(tweak);
         let tweaked = self.add_xonly_tweak(tweak).expect("Tap tweak failed");
         TweakedKeypair(tweaked)
     }

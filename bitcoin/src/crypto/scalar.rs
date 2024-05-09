@@ -2,6 +2,109 @@ use once_cell::sync::Lazy;
 
 use crate::crypto::key::PublicKey;
 
+/// Represents an elliptic curve scalar value which might be zero.
+/// Supports all the same constant-time arithmetic operators supported
+/// by [`Scalar`].
+///
+/// `MaybeScalar` should only be used in cases where it is possible for
+/// an input to be zero. In all possible cases, using [`Scalar`] is more
+/// appropriate. The output of arithmetic operations with non-zero `Scalar`s
+/// can result in a `MaybeScalar` - for example, adding two scalars together
+/// linearly.
+///
+/// ```
+/// use secp::{MaybeScalar, Scalar};
+///
+/// let maybe_scalar: MaybeScalar = Scalar::one() + Scalar::one();
+/// ```
+///
+/// This is because the two scalars might represent values which are additive
+/// inverses of each other (i.e. `x + (-x)`), so the output of their addition
+/// can result in zero, which must be checked for by the caller where
+/// appropriate.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum MaybeScalar {
+    Zero,
+    Valid(Scalar),
+}
+
+use MaybeScalar::*;
+
+impl MaybeScalar {
+    /// Returns a valid `MaybeScalar` with a value of 1.
+    pub fn one() -> MaybeScalar {
+        Valid(Scalar::one())
+    }
+
+    /// Returns a valid `MaybeScalar` with a value of two.
+    pub fn two() -> MaybeScalar {
+        Valid(Scalar::two())
+    }
+
+    /// Returns half of the curve order `n`, specifically `n >> 1`.
+    pub fn half_order() -> MaybeScalar {
+        Valid(Scalar::half_order())
+    }
+
+    /// Returns a valid `MaybeScalar` with the maximum possible value less
+    /// than the curve order, `n - 1`.
+    pub fn max() -> MaybeScalar {
+        Valid(Scalar::max())
+    }
+
+    /// Returns true if this scalar represents zero.
+    pub fn is_zero(&self) -> bool {
+        self == &Zero
+    }
+
+    /// Serializes the scalar to a big-endian byte array representation.
+    ///
+    /// # Warning
+    ///
+    /// Use cautiously. Non-constant time operations on these bytes
+    /// could reveal secret key material.
+    pub fn serialize(&self) -> [u8; 32] {
+        match self {
+            Valid(scalar) => scalar.serialize(),
+            Zero => [0; 32],
+        }
+    }
+
+    /// Returns an option which is `None` if `self == MaybeScalar::Zero`,
+    /// or a `Some(Scalar)` otherwise.
+    pub fn into_option(self) -> Option<Scalar> {
+        Option::from(self)
+    }
+
+    /// Converts the `MaybeScalar` into a `Result<Scalar, String>`,
+    /// returning `Ok(Scalar)` if the scalar is a valid non-zero number, or
+    /// `Err(String)` if `maybe_scalar == MaybeScalar::Zero`.
+    pub fn not_zero(self) -> Result<Scalar, String> {
+        Scalar::try_from(self)
+    }
+
+    /// Coerces the `MaybeScalar` into a [`Scalar`]. Panics if `self == MaybeScalar::Zero`.
+    pub fn unwrap(self) -> Scalar {
+        match self {
+            Valid(point) => point,
+            Zero => panic!("called unwrap on MaybeScalar::Zero"),
+        }
+    }
+}
+
+impl From<k256::NonZeroScalar> for MaybeScalar {
+    fn from(nz_scalar: k256::NonZeroScalar) -> Self {
+        MaybeScalar::from(Scalar::from(nz_scalar))
+    }
+}
+
+impl From<Scalar> for MaybeScalar {
+    /// Converts the scalar into a [`MaybeScalar::Valid`] instance.
+    fn from(scalar: Scalar) -> Self {
+        MaybeScalar::Valid(scalar)
+    }
+}
+
 static SCALAR_ONE: Lazy<Scalar> = Lazy::new(|| {
     Scalar::try_from(&[
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -103,7 +206,7 @@ impl Scalar {
     /// public keys (points) are derived from private keys (scalars).
     /// Since this scalar is non-zero, the point derived from base-point
     /// multiplication is also guaranteed to be valid.
-    /// 
+    ///
     /// Assumes the public key is compressed
     pub fn base_point_mul(&self) -> PublicKey {
         let inner = k256::PublicKey::from_secret_scalar(&self.inner);

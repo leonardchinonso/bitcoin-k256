@@ -9,7 +9,7 @@ default = [ "std" ]
 std = ["hashes/std", "internals/std", "io/std", "units/std", "base58/std", "bech32/std"]
 
 [dependencies]
-k256 = { version = "0.13.3", default-features = false, features = ["arithmetic", "alloc", "schnorr"] }
+k256 = { version = "0.13.3", default-features = false, features = ["arithmetic", "alloc", "schnorr", "ecdsa", "sha256"] }
 units = { package = "bitcoin-units", version = "0.1.0", default-features = false, features = ["alloc"] }
 internals = { package = "bitcoin-internals", version = "0.3.0", features = ["alloc"] }
 io = { package = "bitcoin-io", version = "0.1.1", default-features = false, features = ["alloc"] }
@@ -20,6 +20,7 @@ bech32 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 once_cell = { version = "1.18.0", default-features = false, features = ["std"] }
 rand = "0.8.5"
 hex_lit = "0.1.1"
+subtle = { version = "2.5.0", default-features = false, features = ["std", "const-generics"] }
 
 [dev-dependencies]
 serde_json = "1.0.0"

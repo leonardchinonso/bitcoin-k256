@@ -16,8 +16,11 @@ use io::Write;
 
 use crate::crypto::key::{CompressedPublicKey, Keypair, PrivateKey};
 use crate::internal_macros::impl_bytes_newtype;
+use crate::key::PublicKey;
 use crate::network::NetworkKind;
+use crate::utils::{add_exp_tweak, add_tweak};
 use crate::{prelude::*, CryptoError};
+use crate::{Scalar, XOnlyPublicKey};
 
 /// Version bytes for extended public keys on the Bitcoin network.
 const VERSION_BYTES_MAINNET_PUBLIC: [u8; 4] = [0x04, 0x88, 0xB2, 0x1E];
@@ -59,6 +62,14 @@ impl_bytes_newtype!(Fingerprint, 4);
 hash_newtype! {
     /// Extended key identifier as defined in BIP-32.
     pub struct XKeyIdentifier(hash160::Hash);
+}
+
+struct XPrivateKey([u8; 32]);
+
+impl From<&[u8]> for XPrivateKey {
+    fn from(value: &[u8]) -> Self {
+        <[u8; 32]>::from(value)
+    }
 }
 
 /// Extended private key
@@ -636,6 +647,11 @@ impl Xpriv {
         }
     }
 
+    pub fn to_pub(self) -> PublicKey {
+        let priv_key = self.to_priv();
+        priv_key.public_key()
+    }
+
     /// Constructs BIP340 keypair for Schnorr signatures and Taproot use matching the internal
     /// secret key representation.
     pub fn to_keypair(self) -> Keypair {
@@ -661,7 +677,8 @@ impl Xpriv {
             ChildNumber::Normal { .. } => {
                 // Non-hardened key: compute public data and use that
                 hmac_engine.input(
-                    &secp256k1::PublicKey::from_secret_key(secp, &self.private_key).serialize()[..],
+                    // &secp256k1::PublicKey::from_secret_key(secp, &self.private_key).serialize()[..],
+                    &self.to_pub().serialize()[..],
                 );
             }
             ChildNumber::Hardened { .. } => {
@@ -673,16 +690,15 @@ impl Xpriv {
 
         hmac_engine.input(&u32::from(i).to_be_bytes());
         let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
-        let sk = secp256k1::SecretKey::from_slice(&hmac_result[..32])
+        let sk = k256::SecretKey::from_slice(&hmac_result[..32])
             .expect("statistically impossible to hit");
-        let tweaked = sk
-            .add_tweak(&self.private_key.into())
+        let tweaked = add_tweak(sk, Scalar::from(&self.private_key))
             .expect("statistically impossible to hit");
 
         Ok(Xpriv {
             network: self.network,
             depth: self.depth + 1,
-            parent_fingerprint: self.fingerprint(secp),
+            parent_fingerprint: self.fingerprint(),
             child_number: i,
             private_key: tweaked,
             chain_code: ChainCode::from_hmac(hmac_result),
@@ -714,7 +730,7 @@ impl Xpriv {
             chain_code: data[13..45]
                 .try_into()
                 .expect("45 - 13 == 32, which is the ChainCode length"),
-            private_key: secp256k1::SecretKey::from_slice(&data[46..78])?,
+            private_key: k256::SecretKey::from_slice(&data[46..78])?,
         })
     }
 
@@ -735,13 +751,13 @@ impl Xpriv {
     }
 
     /// Returns the HASH160 of the public key belonging to the xpriv
-    pub fn identifier<C: secp256k1::Signing>(&self, secp: &Secp256k1<C>) -> XKeyIdentifier {
-        Xpub::from_priv(secp, self).identifier()
+    pub fn identifier(&self) -> XKeyIdentifier {
+        Xpub::from_priv(self).identifier()
     }
 
     /// Returns the first four bytes of the identifier
-    pub fn fingerprint<C: secp256k1::Signing>(&self, secp: &Secp256k1<C>) -> Fingerprint {
-        self.identifier(secp)[0..4]
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.identifier()[0..4]
             .try_into()
             .expect("4 is the fingerprint length")
     }
@@ -749,13 +765,13 @@ impl Xpriv {
 
 impl Xpub {
     /// Derives a public key from a private key
-    pub fn from_priv<C: secp256k1::Signing>(secp: &Secp256k1<C>, sk: &Xpriv) -> Xpub {
+    pub fn from_priv(sk: &Xpriv) -> Xpub {
         Xpub {
             network: sk.network,
             depth: sk.depth,
             parent_fingerprint: sk.parent_fingerprint,
             child_number: sk.child_number,
-            public_key: secp256k1::PublicKey::from_secret_key(secp, &sk.private_key),
+            public_key: sk.private_key.public_key(),
             chain_code: sk.chain_code,
         }
     }
@@ -774,23 +790,16 @@ impl Xpub {
     /// Attempts to derive an extended public key from a path.
     ///
     /// The `path` argument can be any type implementing `AsRef<ChildNumber>`, such as `DerivationPath`, for instance.
-    pub fn derive_pub<C: secp256k1::Verification, P: AsRef<[ChildNumber]>>(
-        &self,
-        secp: &Secp256k1<C>,
-        path: &P,
-    ) -> Result<Xpub, Error> {
+    pub fn derive_pub<P: AsRef<[ChildNumber]>>(&self, path: &P) -> Result<Xpub, Error> {
         let mut pk: Xpub = *self;
         for cnum in path.as_ref() {
-            pk = pk.ckd_pub(secp, *cnum)?
+            pk = pk.ckd_pub(*cnum)?
         }
         Ok(pk)
     }
 
     /// Compute the scalar tweak added to this key to get a child key
-    pub fn ckd_pub_tweak(
-        &self,
-        i: ChildNumber,
-    ) -> Result<(secp256k1::SecretKey, ChainCode), Error> {
+    pub fn ckd_pub_tweak(&self, i: ChildNumber) -> Result<(k256::SecretKey, ChainCode), Error> {
         match i {
             ChildNumber::Hardened { .. } => Err(Error::CannotDeriveFromHardenedKey),
             ChildNumber::Normal { index: n } => {
@@ -801,7 +810,7 @@ impl Xpub {
 
                 let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
 
-                let private_key = secp256k1::SecretKey::from_slice(&hmac_result[..32])?;
+                let private_key = k256::SecretKey::from_slice(&hmac_result[..32])?;
                 let chain_code = ChainCode::from_hmac(hmac_result);
                 Ok((private_key, chain_code))
             }
@@ -809,13 +818,9 @@ impl Xpub {
     }
 
     /// Public->Public child key derivation
-    pub fn ckd_pub<C: secp256k1::Verification>(
-        &self,
-        secp: &Secp256k1<C>,
-        i: ChildNumber,
-    ) -> Result<Xpub, Error> {
+    pub fn ckd_pub(&self, i: ChildNumber) -> Result<Xpub, Error> {
         let (sk, chain_code) = self.ckd_pub_tweak(i)?;
-        let tweaked = self.public_key.add_exp_tweak(secp, &sk.into())?;
+        let tweaked = add_exp_tweak(self.public_key, &sk.into())?;
 
         Ok(Xpub {
             network: self.network,
@@ -852,7 +857,7 @@ impl Xpub {
             chain_code: data[13..45]
                 .try_into()
                 .expect("45 - 13 == 32, which is the ChainCode length"),
-            public_key: secp256k1::PublicKey::from_slice(&data[45..78])?,
+            public_key: k256::PublicKey::from_sec1_bytes(&data[45..78])?,
         })
     }
 
@@ -873,9 +878,10 @@ impl Xpub {
 
     /// Returns the HASH160 of the chaincode
     pub fn identifier(&self) -> XKeyIdentifier {
+        let public_key = PublicKey::new(&self.public_key);
         let mut engine = XKeyIdentifier::engine();
         engine
-            .write_all(&self.public_key.serialize())
+            .write_all(&public_key.serialize())
             .expect("engines don't error");
         XKeyIdentifier::from_engine(engine)
     }
@@ -1077,8 +1083,7 @@ mod tests {
         );
     }
 
-    fn test_path<C: secp256k1::Signing + secp256k1::Verification>(
-        secp: &Secp256k1<C>,
+    fn test_path(
         network: NetworkKind,
         seed: &[u8],
         path: DerivationPath,
@@ -1086,11 +1091,11 @@ mod tests {
         expected_pk: &str,
     ) {
         let mut sk = Xpriv::new_master(network, seed).unwrap();
-        let mut pk = Xpub::from_priv(secp, &sk);
+        let mut pk = Xpub::from_priv(&sk);
 
         // Check derivation convenience method for Xpriv
         assert_eq!(
-            &sk.derive_priv(secp, &path).unwrap().to_string()[..],
+            &sk.derive_priv(&path).unwrap().to_string()[..],
             expected_sk
         );
 
@@ -1098,31 +1103,31 @@ mod tests {
         // appropriately if any ChildNumber is hardened
         if path.0.iter().any(|cnum| cnum.is_hardened()) {
             assert_eq!(
-                pk.derive_pub(secp, &path),
+                pk.derive_pub(&path),
                 Err(Error::CannotDeriveFromHardenedKey)
             );
         } else {
             assert_eq!(
-                &pk.derive_pub(secp, &path).unwrap().to_string()[..],
+                &pk.derive_pub(&path).unwrap().to_string()[..],
                 expected_pk
             );
         }
 
         // Derive keys, checking hardened and non-hardened derivation one-by-one
         for &num in path.0.iter() {
-            sk = sk.ckd_priv(secp, num).unwrap();
+            sk = sk.ckd_priv(num).unwrap();
             match num {
                 Normal { .. } => {
-                    let pk2 = pk.ckd_pub(secp, num).unwrap();
-                    pk = Xpub::from_priv(secp, &sk);
+                    let pk2 = pk.ckd_pub(num).unwrap();
+                    pk = Xpub::from_priv(&sk);
                     assert_eq!(pk, pk2);
                 }
                 Hardened { .. } => {
                     assert_eq!(
-                        pk.ckd_pub(secp, num),
+                        pk.ckd_pub(num),
                         Err(Error::CannotDeriveFromHardenedKey)
                     );
-                    pk = Xpub::from_priv(secp, &sk);
+                    pk = Xpub::from_priv(&sk);
                 }
             }
         }
@@ -1194,88 +1199,85 @@ mod tests {
 
     #[test]
     fn test_vector_1() {
-        let secp = Secp256k1::new();
         let seed = hex!("000102030405060708090a0b0c0d0e0f");
 
         // m
-        test_path(&secp, NetworkKind::Main, &seed, "".parse().unwrap(),
+        test_path(&NetworkKind::Main, &seed, "".parse().unwrap(),
                   "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi",
                   "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8");
 
         // m/0h
-        test_path(&secp, NetworkKind::Main, &seed, "0h".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0h".parse().unwrap(),
                   "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7",
                   "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw");
 
         // m/0h/1
-        test_path(&secp, NetworkKind::Main, &seed, "0h/1".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0h/1".parse().unwrap(),
                    "xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs",
                    "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ");
 
         // m/0h/1/2h
-        test_path(&secp, NetworkKind::Main, &seed, "0h/1/2h".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0h/1/2h".parse().unwrap(),
                   "xprv9z4pot5VBttmtdRTWfWQmoH1taj2axGVzFqSb8C9xaxKymcFzXBDptWmT7FwuEzG3ryjH4ktypQSAewRiNMjANTtpgP4mLTj34bhnZX7UiM",
                   "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5");
 
         // m/0h/1/2h/2
-        test_path(&secp, NetworkKind::Main, &seed, "0h/1/2h/2".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0h/1/2h/2".parse().unwrap(),
                   "xprvA2JDeKCSNNZky6uBCviVfJSKyQ1mDYahRjijr5idH2WwLsEd4Hsb2Tyh8RfQMuPh7f7RtyzTtdrbdqqsunu5Mm3wDvUAKRHSC34sJ7in334",
                   "xpub6FHa3pjLCk84BayeJxFW2SP4XRrFd1JYnxeLeU8EqN3vDfZmbqBqaGJAyiLjTAwm6ZLRQUMv1ZACTj37sR62cfN7fe5JnJ7dh8zL4fiyLHV");
 
         // m/0h/1/2h/2/1000000000
-        test_path(&secp, NetworkKind::Main, &seed, "0h/1/2h/2/1000000000".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0h/1/2h/2/1000000000".parse().unwrap(),
                   "xprvA41z7zogVVwxVSgdKUHDy1SKmdb533PjDz7J6N6mV6uS3ze1ai8FHa8kmHScGpWmj4WggLyQjgPie1rFSruoUihUZREPSL39UNdE3BBDu76",
                   "xpub6H1LXWLaKsWFhvm6RVpEL9P4KfRZSW7abD2ttkWP3SSQvnyA8FSVqNTEcYFgJS2UaFcxupHiYkro49S8yGasTvXEYBVPamhGW6cFJodrTHy");
     }
 
     #[test]
     fn test_vector_2() {
-        let secp = Secp256k1::new();
         let seed = hex!("fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542");
 
         // m
-        test_path(&secp, NetworkKind::Main, &seed, "".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "".parse().unwrap(),
                   "xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U",
                   "xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB");
 
         // m/0
-        test_path(&secp, NetworkKind::Main, &seed, "0".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0".parse().unwrap(),
                   "xprv9vHkqa6EV4sPZHYqZznhT2NPtPCjKuDKGY38FBWLvgaDx45zo9WQRUT3dKYnjwih2yJD9mkrocEZXo1ex8G81dwSM1fwqWpWkeS3v86pgKt",
                   "xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH");
 
         // m/0/2147483647h
-        test_path(&secp, NetworkKind::Main, &seed, "0/2147483647h".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0/2147483647h".parse().unwrap(),
                   "xprv9wSp6B7kry3Vj9m1zSnLvN3xH8RdsPP1Mh7fAaR7aRLcQMKTR2vidYEeEg2mUCTAwCd6vnxVrcjfy2kRgVsFawNzmjuHc2YmYRmagcEPdU9",
                   "xpub6ASAVgeehLbnwdqV6UKMHVzgqAG8Gr6riv3Fxxpj8ksbH9ebxaEyBLZ85ySDhKiLDBrQSARLq1uNRts8RuJiHjaDMBU4Zn9h8LZNnBC5y4a");
 
         // m/0/2147483647h/1
-        test_path(&secp, NetworkKind::Main, &seed, "0/2147483647h/1".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0/2147483647h/1".parse().unwrap(),
                   "xprv9zFnWC6h2cLgpmSA46vutJzBcfJ8yaJGg8cX1e5StJh45BBciYTRXSd25UEPVuesF9yog62tGAQtHjXajPPdbRCHuWS6T8XA2ECKADdw4Ef",
                   "xpub6DF8uhdarytz3FWdA8TvFSvvAh8dP3283MY7p2V4SeE2wyWmG5mg5EwVvmdMVCQcoNJxGoWaU9DCWh89LojfZ537wTfunKau47EL2dhHKon");
 
         // m/0/2147483647h/1/2147483646h
-        test_path(&secp, NetworkKind::Main, &seed, "0/2147483647h/1/2147483646h".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0/2147483647h/1/2147483646h".parse().unwrap(),
                   "xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc",
                   "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL");
 
         // m/0/2147483647h/1/2147483646h/2
-        test_path(&secp, NetworkKind::Main, &seed, "0/2147483647h/1/2147483646h/2".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0/2147483647h/1/2147483646h/2".parse().unwrap(),
                   "xprvA2nrNbFZABcdryreWet9Ea4LvTJcGsqrMzxHx98MMrotbir7yrKCEXw7nadnHM8Dq38EGfSh6dqA9QWTyefMLEcBYJUuekgW4BYPJcr9E7j",
                   "xpub6FnCn6nSzZAw5Tw7cgR9bi15UV96gLZhjDstkXXxvCLsUXBGXPdSnLFbdpq8p9HmGsApME5hQTZ3emM2rnY5agb9rXpVGyy3bdW6EEgAtqt");
     }
 
     #[test]
     fn test_vector_3() {
-        let secp = Secp256k1::new();
         let seed = hex!("4b381541583be4423346c643850da4b320e46a87ae3d2a4e6da11eba819cd4acba45d239319ac14f863b8d5ab5a0d0c64d2e8a1e7d1457df2e5a3c51c73235be");
 
         // m
-        test_path(&secp, NetworkKind::Main, &seed, "".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "".parse().unwrap(),
                   "xprv9s21ZrQH143K25QhxbucbDDuQ4naNntJRi4KUfWT7xo4EKsHt2QJDu7KXp1A3u7Bi1j8ph3EGsZ9Xvz9dGuVrtHHs7pXeTzjuxBrCmmhgC6",
                   "xpub661MyMwAqRbcEZVB4dScxMAdx6d4nFc9nvyvH3v4gJL378CSRZiYmhRoP7mBy6gSPSCYk6SzXPTf3ND1cZAceL7SfJ1Z3GC8vBgp2epUt13");
 
         // m/0h
-        test_path(&secp, NetworkKind::Main, &seed, "0h".parse().unwrap(),
+        test_path(NetworkKind::Main, &seed, "0h".parse().unwrap(),
                   "xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L",
                   "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y");
     }

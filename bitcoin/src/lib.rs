@@ -87,6 +87,7 @@ extern crate actual_serde as serde;
 // #[macro_use]
 // mod test_macros;
 mod internal_macros;
+mod utils;
 // #[cfg(feature = "serde")]
 // mod serde_utils;
 //
@@ -135,6 +136,7 @@ pub use crate::{
     crypto::ecdsa,
     crypto::error::Error as CryptoError,
     crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, CompressedPublicKey, WPubkeyHash, XOnlyPublicKey},
+    crypto::scalar::{Scalar, MaybeScalar},
     crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
     // merkle_tree::MerkleBlock,
     network::{Network, NetworkKind},
