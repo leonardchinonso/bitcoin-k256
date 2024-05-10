@@ -14,11 +14,13 @@ use core::{fmt, slice};
 use hashes::{hash160, hash_newtype, sha512, Hash, HashEngine, Hmac, HmacEngine};
 use internals::{impl_array_newtype, write_err};
 use io::Write;
+use k256::SecretKey;
 
 use crate::crypto::key::{CompressedPublicKey, Keypair, PrivateKey};
 use crate::internal_macros::impl_bytes_newtype;
 use crate::key::PublicKey;
 use crate::network::NetworkKind;
+use crate::psbt::serialize::Serialize;
 use crate::utils::{add_exp_tweak, add_tweak};
 use crate::{prelude::*, CryptoError};
 use crate::{Scalar, XOnlyPublicKey};
@@ -68,18 +70,32 @@ hash_newtype! {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct XPrivateKey([u8; 32]);
 
-impl TryFrom<&[u8]> for XPrivateKey {
-    type Error = TryFromSliceError;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let inner = <[u8; 32]>::try_from(value)?;
+impl XPrivateKey {
+    fn from_slice(value: &[u8]) -> Result<Self, CryptoError> {
+        SecretKey::from_slice(value).map_err(|_| CryptoError::InvalidSecretKey)?;
+        let inner = <[u8; 32]>::try_from(value).map_err(|_| CryptoError::InvalidSecretKey)?;
         Ok(XPrivateKey(inner))
+    }
+
+    fn from_secret_key(value: &SecretKey) -> Self {
+        let inner = value.to_bytes();
+        let inner = inner.as_slice();
+        XPrivateKey(
+            <[u8; 32]>::try_from(inner)
+                .expect("XPrivateKey should not fail to convert to secret key"),
+        )
     }
 }
 
 impl XPrivateKey {
     fn to_secret_key(self) -> k256::SecretKey {
         k256::SecretKey::from_slice(self.0.as_slice()).expect("should be a valid secret key")
+    }
+
+    fn to_public_key(self) -> PublicKey {
+        let sec_key = self.to_secret_key();
+        let inner = k256::PublicKey::from_secret_scalar(&sec_key.to_nonzero_scalar());
+        PublicKey::from_slice(&inner.to_sec1_bytes()).expect("improbable to fail")
     }
 }
 
@@ -638,10 +654,8 @@ impl Xpriv {
         let mut hmac_engine: HmacEngine<sha512::Hash> = HmacEngine::new(b"Bitcoin seed");
         hmac_engine.input(seed);
         let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
-        let private_key = match XPrivateKey::try_from(&hmac_result[..32]) {
-            Ok(p) => p,
-            Err(_) => return Err(Error::Secp256k1(CryptoError::InvalidSecretKey)),
-        };
+        let private_key =
+            XPrivateKey::from_slice(&hmac_result[..32]).map_err(|e| Error::Secp256k1(e))?;
 
         Ok(Xpriv {
             network: network.into(),
@@ -663,8 +677,7 @@ impl Xpriv {
     }
 
     pub fn to_pub(self) -> PublicKey {
-        let priv_key = self.to_priv();
-        priv_key.public_key()
+        self.private_key.to_public_key()
     }
 
     /// Constructs BIP340 keypair for Schnorr signatures and Taproot use matching the internal
@@ -691,9 +704,7 @@ impl Xpriv {
         match i {
             ChildNumber::Normal { .. } => {
                 // Non-hardened key: compute public data and use that
-                hmac_engine.input(
-                    &self.to_pub().serialize()[..],
-                );
+                hmac_engine.input(&self.to_pub().serialize()[..]);
             }
             ChildNumber::Hardened { .. } => {
                 // Hardened key: use only secret data to prevent public derivation
@@ -704,21 +715,24 @@ impl Xpriv {
 
         hmac_engine.input(&u32::from(i).to_be_bytes());
         let hmac_result: Hmac<sha512::Hash> = Hmac::from_engine(hmac_engine);
+
         let sk = k256::SecretKey::from_slice(&hmac_result[..32])
             .expect("statistically impossible to hit");
+
         let tweaked = add_tweak(
             sk,
             Scalar::try_from(&self.private_key.0).expect("should be a valid secret key"),
         )
         .expect("statistically impossible to hit");
 
+        let private_key = XPrivateKey::from_secret_key(&tweaked);
+
         Ok(Xpriv {
             network: self.network,
             depth: self.depth + 1,
             parent_fingerprint: self.fingerprint(),
             child_number: i,
-            private_key: XPrivateKey::try_from(tweaked.to_bytes().as_slice())
-                .expect("improbable to fail"),
+            private_key,
             chain_code: ChainCode::from_hmac(hmac_result),
         })
     }
@@ -748,8 +762,7 @@ impl Xpriv {
             chain_code: data[13..45]
                 .try_into()
                 .expect("45 - 13 == 32, which is the ChainCode length"),
-            private_key: XPrivateKey::try_from(&data[46..78])
-                .expect("should be a valid u8 of 32 bytes"),
+            private_key: XPrivateKey::from_slice(&data[46..78])?,
         })
     }
 
@@ -1118,7 +1131,9 @@ mod tests {
         let mut pk = Xpub::from_priv(&sk);
 
         // Check derivation convenience method for Xpriv
-        assert_eq!(&sk.derive_priv(&path).unwrap().to_string()[..], expected_sk);
+        let actual_sk = &sk.derive_priv(&path).unwrap().to_string()[..];
+
+        assert_eq!(actual_sk, expected_sk);
 
         // Check derivation convenience method for Xpub, should error
         // appropriately if any ChildNumber is hardened

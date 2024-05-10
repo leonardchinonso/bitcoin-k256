@@ -30,6 +30,7 @@ use k256::schnorr::{
 };
 use k256::{NonZeroScalar, SecretKey};
 use once_cell::sync::Lazy;
+use subtle::ConditionallySelectable;
 
 use crate::blockdata::script::ScriptBuf;
 use crate::common::constants as common_constants;
@@ -37,6 +38,7 @@ use crate::common::types::Message;
 use crate::internal_macros::impl_asref_push_bytes;
 use crate::network::NetworkKind;
 use crate::taproot::{TapNodeHash, TapTweakHash};
+use crate::utils::add_tweak_to_scalar;
 use crate::Parity;
 use crate::{crypto, CryptoError};
 use crate::{ecdsa, prelude::*};
@@ -99,7 +101,7 @@ use super::utils::from_hex;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct XOnlyPublicKey {
-    inner: [u8; 33],
+    inner: [u8; 32],
 }
 
 impl XOnlyPublicKey {
@@ -112,8 +114,7 @@ impl XOnlyPublicKey {
     }
 
     pub fn serialize(&self) -> [u8; 32] {
-        let s = &self.inner[1..];
-        s.try_into().expect("XOnlyPublicKey should have 33 bytes")
+        self.inner.clone()
     }
 
     pub fn add_tweak(self, tweak: Scalar) -> Result<(XOnlyPublicKey, Parity), String> {
@@ -130,21 +131,45 @@ impl XOnlyPublicKey {
         tweak: Scalar,
     ) -> Result<bool, String> {
         let public_key = PublicKey::from(self);
-        public_key.tweak_add_check(PublicKey::from(tweaked_key), parity, tweak)
+
+        // Since [PublicKey::from] always returns an even parity,
+        // we check if the original tweak parity was odd and set
+        // it back to odd.
+        let mut tweaked_public_key = PublicKey::from(tweaked_key);
+        if let Parity::Odd = parity {
+            tweaked_public_key = tweaked_public_key.to_odd_y();
+        };
+
+        public_key.tweak_add_check(tweaked_public_key, tweak)
     }
 
-    pub fn from_slice(pk_slice: &[u8]) -> Result<XOnlyPublicKey, FromSliceError> {
-        let public_key = PublicKey::from_slice(pk_slice)?;
-        Ok(XOnlyPublicKey::from(public_key))
-    }
-}
+    /// Converts a slice of length 32 bytes to [XOnlyPublicKey]
+    ///
+    /// Returns a type of [FromSliceError] if the slice is invalid
+    pub fn from_slice(value: &[u8]) -> Result<XOnlyPublicKey, FromSliceError> {
+        let len = value.len();
+        let bytes: [u8; 33] = match value.len() {
+            32 => {
+                let mut inner = [0u8; common_constants::PUBLIC_KEY_SIZE];
+                // picking even parity
+                inner[0] = 2;
+                for i in 1..inner.len() {
+                    inner[i] = value[i - 1];
+                }
+                inner
+            }
+            33 => {
+                let prefix = value[0];
+                if prefix != 2 && prefix != 3 {
+                    return Err(FromSliceError::InvalidKeyPrefix(prefix));
+                }
+                value.try_into().expect("should not fail")
+            }
+            _ => return Err(FromSliceError::InvalidLength(len)),
+        };
 
-impl TryFrom<&[u8]> for XOnlyPublicKey {
-    type Error = FromSliceError;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let pubkey = PublicKey::from_slice(value)?;
-        Ok(Self::from(pubkey))
+        XOnlyPublicKey::try_from(&bytes)
+            .map_err(|_| FromSliceError::Secp256k1(CryptoError::InvalidPublicKey))
     }
 }
 
@@ -284,13 +309,8 @@ impl PublicKey {
 
     /// Constructs a compressed ECDSA public key from the provided generic Secp256k1 public key
     pub fn new(key: impl Into<k256::PublicKey>) -> PublicKey {
-        /// Returns the secp256k1 generator base point `G`.
-        pub fn generator() -> PublicKey {
-            *GENERATOR_POINT
-        }
-
         PublicKey {
-            compressed: false,
+            compressed: true,
             inner: key.into(),
         }
     }
@@ -298,7 +318,7 @@ impl PublicKey {
     /// Constructs an uncompressed ECDSA public key from the provided generic Secp256k1 public key
     pub fn new_uncompressed(key: impl Into<k256::PublicKey>) -> PublicKey {
         PublicKey {
-            compressed: true,
+            compressed: false,
             inner: key.into(),
         }
     }
@@ -326,7 +346,34 @@ impl PublicKey {
     }
 
     fn with_serialized<R, F: FnOnce(&[u8]) -> R>(&self, f: F) -> R {
-        f(&self.serialize())
+        if self.compressed {
+            f(&self.serialize())
+        } else {
+            f(&self.serialize_uncompressed())
+        }
+    }
+
+    /// Returns a public key with the same X-coordinate but with the Y-coordinate's parity set
+    /// to the given parity, with `subtle::Choice::from(1)` indicating odd parity and
+    /// `subtle::Choice::from(0)` indicating even parity.
+    pub fn with_parity(self, parity: subtle::Choice) -> Self {
+        let inner = {
+            let mut affine = self.inner.as_affine().clone();
+            let should_negate = affine.y_is_odd() ^ parity;
+            affine.conditional_assign(&(-affine), should_negate);
+            k256::PublicKey::from_affine(affine).unwrap()
+        };
+        PublicKey::from(inner)
+    }
+
+    /// Returns a new point with the Y-coordinate coerced flipped to be even.
+    pub fn to_even_y(self) -> Self {
+        self.with_parity(subtle::Choice::from(0))
+    }
+
+    /// Returns a new point with the Y-coordinate coerced flipped to be odd.
+    pub fn to_odd_y(self) -> Self {
+        self.with_parity(subtle::Choice::from(1))
     }
 
     /// Returns bitcoin 160-bit hash of the public key
@@ -336,9 +383,13 @@ impl PublicKey {
 
     /// Returns bitcoin 160-bit hash of the public key for witness program
     pub fn wpubkey_hash(&self) -> Result<WPubkeyHash, UncompressedPublicKeyError> {
-        return Ok(WPubkeyHash::from_byte_array(
-            hash160::Hash::hash(&self.serialize()).to_byte_array(),
-        ));
+        if self.compressed {
+            Ok(WPubkeyHash::from_byte_array(
+                hash160::Hash::hash(&self.serialize()).to_byte_array(),
+            ))
+        } else {
+            Err(UncompressedPublicKeyError)
+        }
     }
 
     /// Returns the script code used to spend a P2WPKH input.
@@ -439,8 +490,13 @@ impl PublicKey {
     /// assert_eq!(unsorted, sorted);
     /// ```
     pub fn to_sort_key(self) -> SortKey {
-        let buf = ArrayVec::from_slice(&self.inner.to_sec1_bytes());
-        SortKey(buf)
+        if self.compressed {
+            let buf = ArrayVec::from_slice(&self.serialize());
+            SortKey(buf)
+        } else {
+            let buf = ArrayVec::from_slice(&self.serialize_uncompressed());
+            SortKey(buf)
+        }
     }
 
     /// Deserialize a public key from a slice
@@ -506,11 +562,6 @@ impl PublicKey {
     /// Returns a String as Error if the tweak is at infinity or zero.
     /// This error type should be changed.
     pub fn add_tweak(self, tweak: Scalar) -> Result<(PublicKey, Parity), String> {
-        let parity = match self.has_odd_y() {
-            true => Parity::Odd,
-            false => Parity::Even,
-        };
-
         // T = t * G
         let big_t = tweak * G;
         // P' = P + T
@@ -521,7 +572,10 @@ impl PublicKey {
             Valid(pk) => pk,
         };
 
-        println!("Original T1: {:?}", big_t);
+        let parity = match tweaked_pubkey.has_odd_y() {
+            true => Parity::Odd,
+            false => Parity::Even,
+        };
 
         Ok((tweaked_pubkey, parity))
     }
@@ -530,22 +584,13 @@ impl PublicKey {
     /// tweaked key.
     ///
     /// NB: Will not error if the tweaked public key has an odd value and can't be used for
-    ///     BIP 340-342 purposes. However the check will return false.
+    ///     BIP 340-342 purposes.
     ///
     /// Returns a String as Error if the tweak is at infinity or zero.
     /// This error type should be changed.
-    pub fn tweak_add_check(
-        self,
-        tweaked_key: PublicKey,
-        parity: Parity,
-        tweak: Scalar,
-    ) -> Result<bool, String> {
-        if parity != Parity::Even {
-            return Ok(false);
-        }
-
+    pub fn tweak_add_check(self, tweaked_key: PublicKey, tweak: Scalar) -> Result<bool, String> {
         // T_original = t * G
-        let original_big_t = tweak * PublicKey::generator();
+        let original_big_t = tweak * G;
         // T_recomputed = P' - P
         let recomputed_big_t = match tweaked_key - self {
             Infinity => {
@@ -556,32 +601,6 @@ impl PublicKey {
 
         // check that T_original == T_recomputed
         Ok(original_big_t == recomputed_big_t)
-    }
-}
-
-impl TryFrom<&[u8]> for PublicKey {
-    type Error = InvalidPointBytes;
-
-    /// Parses a compressed or uncompressed DER encoding of a public key. See
-    /// [`PublicKey::serialize`] and [`PublicKey::serialize_uncompressed`]. The slice
-    /// length should be either 33 or 65 for compressed and uncompressed
-    /// encodings respectively.
-    ///
-    /// Returns a String as Error, should replace with proper Error.
-    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let len = bytes.len();
-        match k256::PublicKey::from_sec1_bytes(bytes) {
-            Ok(public_key) => match len {
-                33 => Ok(PublicKey::new(public_key)),
-                65 => Ok(PublicKey::new_uncompressed(public_key)),
-                _ => {
-                    return Err(InvalidPointBytes);
-                }
-            },
-            Err(err) => {
-                return Err(InvalidPointBytes);
-            }
-        }
     }
 }
 
@@ -1176,25 +1195,15 @@ impl Keypair {
         self.signing_key
     }
 
-    pub fn add_xonly_tweak(self, tweak: Scalar) -> Result<Self, String> {
+    pub fn add_xonly_tweak(self, mut tweak: Scalar) -> Result<Self, CryptoError> {
         let sec_key = Scalar::from(self.signing_key.as_nonzero_scalar());
 
-        if sec_key.greater_than_curve_order_minus_one() {
-            return Err(format!(
-                "Secret key cannot be greater than or equal to the Secp256k1 curve order"
-            ));
-        }
-
-        let tweak = Scalar::reduce_from(&tweak.serialize());
-
-        // x' = (x + t) % CURVE_ORDER
-        let tweaked_scalar = sec_key + tweak;
-        let mut tweaked_scalar_bytes = tweaked_scalar.serialize();
+        let mut tweaked_scalar_bytes = add_tweak_to_scalar(sec_key, tweak)?.serialize();
         tweaked_scalar_bytes = Scalar::reduce_from(&tweaked_scalar_bytes).serialize();
 
         let signing_key = match SchnorrSigningKey::from_bytes(&tweaked_scalar_bytes) {
             Ok(s) => s,
-            Err(err) => return Err(format!("Error creating SigningKey from bytes: {:?}", err)),
+            Err(_) => return Err(CryptoError::InvalidTweak),
         };
 
         Ok(Keypair { signing_key })
@@ -1366,9 +1375,11 @@ impl TapTweak for UntweakedPublicKey {
         let tweak = TapTweakHash::from_key_and_tweak(self, merkle_root).to_scalar();
         let (output_key, parity) = self.add_tweak(tweak).expect("Tap tweak failed");
 
-        debug_assert!(self
+        let is_valid = self
             .tweak_add_check(output_key, parity, tweak)
-            .expect("checking tweaked public key should not fail"));
+            .expect("checking tweaked public key should not fail");
+
+        debug_assert!(is_valid);
         (TweakedPublicKey(output_key), parity)
     }
 
@@ -1813,8 +1824,13 @@ mod conversions {
         }
 
         impl From<&XOnlyPublicKey> for PublicKey {
-            fn from(value: &XOnlyPublicKey) -> Self {
-                Self::try_from(&value.inner).expect("Improbable that this should fail")
+            fn from(value: &XOnlyPublicKey) -> PublicKey {
+                let mut inner = [0u8; common_constants::PUBLIC_KEY_SIZE];
+                inner[0] = 2;
+                for i in 1..inner.len() {
+                    inner[i] = value.inner[i - 1];
+                }
+                PublicKey::try_from(inner).expect("Improbable that this should fail")
             }
         }
     }
@@ -1848,9 +1864,9 @@ mod conversions {
         impl From<k256::PublicKey> for XOnlyPublicKey {
             fn from(value: k256::PublicKey) -> Self {
                 let s = value.to_sec1_bytes().to_vec();
-                let s = s.as_slice();
+                let s = &s[1..];
                 XOnlyPublicKey {
-                    inner: s.try_into().expect("XOnlyPublicKey should have 33 bytes"),
+                    inner: s.try_into().expect("XOnlyPublicKey should have 32 bytes"),
                 }
             }
         }
@@ -1921,6 +1937,59 @@ mod conversions {
             /// Returns a String as Error, should replace with proper Error.
             fn try_from(bytes: &[u8; 33]) -> Result<Self, Self::Error> {
                 Self::try_from(bytes as &[u8])
+            }
+        }
+
+        impl TryFrom<[u8; 33]> for PublicKey {
+            type Error = InvalidPointBytes;
+
+            /// Parses a compressed DER encoding of a point. See [`PublicKey::serialize`].
+            ///
+            /// Returns a String as Error, should replace with proper Error.
+            fn try_from(bytes: [u8; 33]) -> Result<Self, Self::Error> {
+                Self::try_from(bytes.as_slice())
+            }
+        }
+
+        impl TryFrom<&[u8]> for PublicKey {
+            type Error = InvalidPointBytes;
+
+            /// Parses a compressed or uncompressed DER encoding of a public key. See
+            /// [`PublicKey::serialize`] and [`PublicKey::serialize_uncompressed`]. The slice
+            /// length should be either 33 or 65 for compressed and uncompressed
+            /// encodings respectively.
+            ///
+            /// Returns a [`InvalidPointBytes`] if it fails.
+            fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+                let len = bytes.len();
+                match k256::PublicKey::from_sec1_bytes(bytes) {
+                    Ok(public_key) => match len {
+                        33 => Ok(PublicKey::new(public_key)),
+                        65 => Ok(PublicKey::new_uncompressed(public_key)),
+                        _ => {
+                            return Err(InvalidPointBytes);
+                        }
+                    },
+                    Err(_) => {
+                        return Err(InvalidPointBytes);
+                    }
+                }
+            }
+        }
+
+        impl TryFrom<&[u8; 33]> for XOnlyPublicKey {
+            type Error = InvalidPointBytes;
+
+            /// Parses a compressed or uncompressed DER encoding of a public key. See
+            /// [`XOnlyPublicKey::serialize`]. The slice length should be 32 bytes.
+            ///
+            /// Returns a [`InvalidPointBytes`] if it fails.
+            fn try_from(bytes: &[u8; 33]) -> Result<Self, Self::Error> {
+                // ensure it converts to a SEC1 public key
+                let _ = PublicKey::try_from(bytes)?;
+                Ok(XOnlyPublicKey {
+                    inner: bytes[1..].try_into().expect("should coerce to 32 bytes"),
+                })
             }
         }
     }
@@ -2319,6 +2388,8 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn private_key_debug_is_obfuscated() {
+        // TODO(chinonso): Should manually implement as k256 does not
+        // obfuscate secret keys
         let sk =
             PrivateKey::from_str("cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy").unwrap();
         let want =
@@ -2330,6 +2401,8 @@ mod tests {
     #[test]
     #[cfg(all(not(feature = "std"), feature = "no-std"))]
     fn private_key_debug_is_obfuscated() {
+        // TODO(chinonso): Should manually implement as k256 does not
+        // obfuscate secret keys
         let sk =
             PrivateKey::from_str("cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy").unwrap();
         // Why is this not shortened? In rust-secp256k1/src/secret it is printed with "#{:016x}"?

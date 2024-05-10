@@ -311,9 +311,15 @@ mod tests {
 
     #[test]
     fn write_serialized_signature() {
-        let hex = "3046022100839c1fbc5304de944f697c9f4b1d01d1faeba32d751c0f7acb21ac8a0f436a72022100e89bd46bb3a5a62adc679f659b7ce876d83ee297c7a5587b2011c4fcc72eab45";
+        // let hex = "3046022100839c1fbc5304de944f697c9f4b1d01d1faeba32d751c0f7acb21ac8a0f436a72022100e89bd46bb3a5a62adc679f659b7ce876d83ee297c7a5587b2011c4fcc72eab45";
+        let hex: [u8; 72] = [
+            48, 70, 2, 33, 0, 131, 156, 31, 188, 83, 4, 222, 148, 79, 105, 124, 159, 75, 29, 1,
+            209, 250, 235, 163, 45, 117, 28, 15, 122, 203, 33, 172, 138, 15, 67, 106, 114, 2, 33,
+            0, 232, 155, 212, 107, 179, 165, 166, 42, 220, 103, 159, 101, 155, 124, 232, 118, 216,
+            62, 226, 151, 199, 165, 88, 123, 32, 17, 196, 252, 199, 46, 171, 69,
+        ];
         let sig = Signature {
-            signature: k256::ecdsa::Signature::from_str(hex).unwrap(),
+            signature: k256::ecdsa::Signature::from_der(hex.as_slice()).unwrap(),
             sighash_type: EcdsaSighashType::All,
         };
 

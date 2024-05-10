@@ -1,9 +1,13 @@
+use k256::SecretKey;
 use once_cell::sync::Lazy;
 use subtle::{ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
 
-use crate::crypto::{
-    key::PublicKey,
-    utils::{ct_slice_lex_cmp, xor_arrays},
+use crate::{
+    crypto::{
+        key::PublicKey,
+        utils::{ct_slice_lex_cmp, xor_arrays},
+    },
+    CryptoError,
 };
 
 /// The largest possible 256-bit integer, represented as a byte array.
@@ -305,6 +309,10 @@ impl Scalar {
     /// Checks if the scalar is greater than the SECP256k1 curve - 1
     pub fn greater_than_curve_order_minus_one(&self) -> bool {
         bool::from(self.ct_gt(&Self::max()))
+    }
+
+    pub fn to_secret_key(self) -> Result<SecretKey, CryptoError> {
+        k256::SecretKey::from_slice(&self.serialize()).map_err(|_| CryptoError::InvalidSecretKey)
     }
 
     /// Converts a 32-byte array into a `Scalar` by interpreting it as a big-endian
